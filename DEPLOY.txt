@@ -1,0 +1,17 @@
+배포 순서
+
+1. GitHub 새 저장소 생성
+2. app.py / requirements.txt / .streamlit/config.toml 업로드
+3. Streamlit Community Cloud에서 새 앱 생성
+4. Repository 선택
+5. Main file path = app.py
+6. Deploy
+
+사용 예:
+- 날짜 선택
+- 품목: 표고
+- 시장: 가락 + 강서
+- ✅ 경매결과 있음
+- ⏳ 아직 결과 없음
+- 우측 🔄 재로딩으로 갱신
+- ✅ 서부청과를 누르면 강서 서부청과 시세 확인
