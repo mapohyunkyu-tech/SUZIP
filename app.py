@@ -633,41 +633,17 @@ def build_excel_bytes(selected_frames: List[pd.DataFrame]) -> bytes:
 
 
 # =========================================================
-# 공개 세부규격 흔적 검사기 v7
-# - 품목과 무관한 42망 오탐 방지
-# - 법인별 공개 사이트 자동 탐색
+# 공개 세부규격 흔적 검사기 v8
+# - 품목 검색폼 자동 감지/제출
+# - 검색결과의 품목 상세링크 추적
+# - 품목별 현장규격 키워드 분리
+# - 공개 GET/POST만 사용, 로그인/권한우회 없음
 # =========================================================
-TRACE_KEYWORDS = [
-    "42망", "45망", "40망", "38망", "36망",
-    "4수", "4개들이", "4포기", "망치수", "치수", "세부규격", "규격",
-    "size", "spec", "standard", "grade", "class", "level", "unit",
-    "sizecd", "size_cd", "speccd", "spec_cd",
-    "gradecd", "grade_cd", "classcd", "class_cd",
-    "standardcd", "standard_cd",
-]
-
-TRACE_SIZE_RE = re.compile(
-    r'(?<!\d)(?:36|38|40|42|43|45|47|48|50|52|55)'
-    r'(?:\s*[-~]\s*(?:36|38|40|42|43|45|47|48|50|52|55))?\s*망'
-)
-TRACE_FOUR_RE = re.compile(r'(?:4\s*수|4\s*개(?:들이)?|4\s*포기)')
-TRACE_FIELD_RE = re.compile(
-    r'(?i)\b(?:size|spec|standard|grade|class|level|unit)'
-    r'(?:[_-]?(?:cd|code|nm|name|no|id|seq))?\b'
-)
-TRACE_FIELD_NUMBER_RE = re.compile(
-    r'(?i)(?:size|spec|standard|grade|class|level)'
-    r'[^<>{}\n]{0,90}(?:36|38|40|42|43|45|47|48|50|52|55)'
-)
-TRACE_PRICE_RE = re.compile(r'(?<!\d)(?:\d{1,3}(?:,\d{3})+|\d{4,7})\s*원?')
-
-# 공개/공식 사이트 시작점. 특정 세부 페이지가 없으면 같은 도메인의
-# 시세/경매 링크를 자동으로 1단계 탐색한다.
 TRACE_COMPANIES = {
     "가락 · 대아청과": {
         "urls": [
-            "https://dagreen.co.kr/",
-            "https://dagreen.co.kr/market_price_new/daily_market_view.asp?board_seq=23969&keyword=&opt=&page=2138",
+            "https://www.dagreen.co.kr/market_price_new/daily_market.asp",
+            "https://www.dagreen.co.kr/",
         ]
     },
     "가락 · 동화청과": {
@@ -697,13 +673,56 @@ TRACE_COMPANIES = {
 }
 
 DISCOVERY_WORDS = (
-    "시세", "경매", "유통", "시장", "가격", "실시간",
-    "price", "auction", "market", "distribution", "trend", "result"
+    "시세", "경매", "가격", "유통", "시장", "품목", "거래", "동향",
+    "price", "auction", "market", "result", "trend", "item", "product"
+)
+
+SEARCH_WORDS = (
+    "검색", "조회", "품목", "품종", "상품", "keyword", "search", "query",
+    "item", "product", "pum", "jong", "name", "sch", "find"
+)
+
+DANGEROUS_WORDS = (
+    "login", "logout", "member", "join", "write", "edit", "delete", "remove",
+    "insert", "update", "upload", "mail", "send", "order", "reserve", "payment",
+    "로그인", "회원", "가입", "글쓰기", "수정", "삭제", "주문", "예약", "결제"
+)
+
+GENERIC_FIELD_RE = re.compile(
+    r'(?i)\b(?:size|spec|standard|grade|class|level|unit)'
+    r'(?:[_-]?(?:cd|code|nm|name|no|id|seq))?\b'
+)
+
+PRICE_RE = re.compile(r'(?<!\d)(?:\d{1,3}(?:,\d{3})+|\d{4,7})\s*원?')
+
+CABBAGE_RE = re.compile(
+    r'(?<!\d)(?:36|38|40|42|43|45|47|48|50|52|55)'
+    r'(?:\s*[-~]\s*(?:36|38|40|42|43|45|47|48|50|52|55))?\s*망'
+)
+FOUR_RE = re.compile(r'(?:4\s*수|4\s*개(?:들이)?|4\s*포기)')
+
+SWEET_POTATO_RE = re.compile(
+    r'(?:긴긴특|긴긴상|긴긴중|긴긴하|긴긴소|긴왕|긴특|긴상|긴중|긴하|긴소|'
+    r'공특|공상|공중|공하|왕왕|특상|상중|파지|B품)',
+    re.I,
+)
+POTATO_RE = re.compile(
+    r'(?:왕왕|왕특|특대|대특|특상|상중|중하|파지|B품)',
+    re.I,
+)
+SHIITAKE_RE = re.compile(
+    r'(?:\bC\s*/?\s*T\b|\bCT\b|P\s*[-/]?\s*BOX|PP\s*대|상자)',
+    re.I,
+)
+
+SEARCH_INPUT_RE = re.compile(
+    r'(?i)(?:keyword|search|query|item|product|pum|pummok|pumjong|jong|'
+    r'goods|name|sch|find|word|key)'
 )
 
 
 def _is_public_http_url(url: str) -> Tuple[bool, str]:
-    """서버측 URL 요청이 사설/로컬 주소로 가지 않게 막는다."""
+    """사설/로컬 주소는 서버측 요청 대상에서 제외."""
     try:
         p = urlparse(url.strip())
         if p.scheme not in ("http", "https"):
@@ -730,12 +749,8 @@ def _is_public_http_url(url: str) -> Tuple[bool, str]:
             except ValueError:
                 continue
             if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_reserved
-                or ip.is_multicast
-                or ip.is_unspecified
+                ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified
             ):
                 return False, "공개 인터넷 주소가 아닌 대상은 검사하지 않습니다."
         return True, ""
@@ -745,27 +760,59 @@ def _is_public_http_url(url: str) -> Tuple[bool, str]:
         return False, f"주소 확인 오류: {ex}"
 
 
-def _safe_public_get(session: requests.Session, url: str, timeout: int = 16):
-    """리다이렉트도 한 단계씩 검증하면서 공개 URL만 GET."""
+def _same_host(a: str, b: str) -> bool:
+    return (urlparse(a).hostname or "").lower() == (urlparse(b).hostname or "").lower()
+
+
+def _safe_public_request(
+    session: requests.Session,
+    method: str,
+    url: str,
+    params=None,
+    data=None,
+    timeout: int = 16,
+):
+    """공개 URL만 요청. 리다이렉트 대상도 매번 재검증."""
     current = url.strip()
+    req_method = method.upper()
+    req_params = params
+    req_data = data
+
     for _ in range(6):
         ok, reason = _is_public_http_url(current)
         if not ok:
             raise ValueError(reason)
 
-        r = session.get(current, timeout=timeout, allow_redirects=False)
+        r = session.request(
+            req_method,
+            current,
+            params=req_params,
+            data=req_data,
+            timeout=timeout,
+            allow_redirects=False,
+        )
+
         if r.status_code in (301, 302, 303, 307, 308):
-            location = r.headers.get("Location")
-            if not location:
+            loc = r.headers.get("Location")
+            if not loc:
                 r.raise_for_status()
                 return r
-            current = urljoin(current, location)
+            current = urljoin(current, loc)
+            # 검색 POST 뒤 일반적인 302/303은 GET으로 따라감
+            if r.status_code in (301, 302, 303):
+                req_method = "GET"
+                req_params = None
+                req_data = None
             continue
 
         r.raise_for_status()
         return r
 
     raise RuntimeError("리다이렉트가 너무 많습니다.")
+
+
+def _safe_public_get(session: requests.Session, url: str, timeout: int = 16):
+    return _safe_public_request(session, "GET", url, timeout=timeout)
 
 
 def _decode_public_response(r: requests.Response) -> str:
@@ -778,23 +825,25 @@ def _decode_public_response(r: requests.Response) -> str:
         return r.content.decode("utf-8", errors="replace")
 
 
-def _clean_context(text: str) -> str:
-    return re.sub(r"\s+", " ", BeautifulSoup(text, "html.parser").get_text(" ", strip=True)).strip()
+def _clean_html_text(raw: str) -> str:
+    try:
+        return re.sub(
+            r"\s+",
+            " ",
+            BeautifulSoup(raw, "html.parser").get_text(" ", strip=True),
+        ).strip()
+    except Exception:
+        return re.sub(r"\s+", " ", raw).strip()
 
 
-def _item_windows(text: str, item: str, radius: int = 1300) -> List[Tuple[int, int]]:
-    """품목명이 실제로 나타난 위치 주변만 검사한다."""
+def _item_windows(text: str, item: str, radius: int = 2200) -> List[Tuple[int, int]]:
     if not item:
         return [(0, len(text))]
     positions = [m.start() for m in re.finditer(re.escape(item), text, flags=re.I)]
     if not positions:
         return []
 
-    ranges = []
-    for pos in positions[:100]:
-        ranges.append((max(0, pos - radius), min(len(text), pos + len(item) + radius)))
-
-    # 겹치는 구간 합치기
+    ranges = [(max(0, p-radius), min(len(text), p+len(item)+radius)) for p in positions[:120]]
     ranges.sort()
     merged: List[Tuple[int, int]] = []
     for a, b in ranges:
@@ -805,72 +854,101 @@ def _item_windows(text: str, item: str, radius: int = 1300) -> List[Tuple[int, i
     return merged
 
 
-def _trace_add(
+def _patterns_for_item(item: str):
+    text = (item or "").replace(" ", "")
+    patterns = []
+    if "양배추" in text or text == "배추":
+        patterns += [("망규격", CABBAGE_RE), ("4수/4개", FOUR_RE)]
+    if "고구마" in text:
+        patterns += [("고구마 세부등급", SWEET_POTATO_RE)]
+    if "감자" in text:
+        patterns += [("감자 세부등급", POTATO_RE)]
+    if "표고" in text:
+        patterns += [("표고 포장규격", SHIITAKE_RE)]
+    # 필드+숫자는 모든 품목에서 후보로 보되 실제 품목 주변일 때만
+    patterns += [(
+        "필드+숫자",
+        re.compile(
+            r'(?i)(?:size|spec|standard|grade|class|level)'
+            r'[^<>{}\n]{0,100}(?:36|38|40|42|43|45|47|48|50|52|55)'
+        )
+    )]
+    return patterns
+
+
+def _add_hit(
     hits: List[Dict[str, str]],
     source: str,
+    item: str,
     kind: str,
     match: str,
-    text: str,
+    full_text: str,
     start: int,
     end: int,
-    item: str,
 ):
-    left = max(0, start - 180)
-    right = min(len(text), end + 180)
-    raw_context = text[left:right]
-    context = _clean_context(raw_context)
-    price_candidates = []
-    for pm in TRACE_PRICE_RE.finditer(context):
-        val = pm.group(0).strip()
-        digits = re.sub(r"\D", "", val)
-        if digits and 100 <= int(digits) <= 10000000:
-            price_candidates.append(val)
-    # 중복/과다 억제
-    price_candidates = list(dict.fromkeys(price_candidates))[:8]
+    left = max(0, start - 260)
+    right = min(len(full_text), end + 260)
+    context = _clean_html_text(full_text[left:right])
+
+    prices = []
+    for pm in PRICE_RE.finditer(context):
+        raw = pm.group(0).strip()
+        digits = re.sub(r"\D", "", raw)
+        if digits:
+            n = int(digits)
+            if 100 <= n <= 10000000:
+                prices.append(raw)
+    prices = list(dict.fromkeys(prices))[:10]
 
     hits.append({
         "품목": item,
         "종류": kind,
         "일치": match,
-        "가격후보": " / ".join(price_candidates),
+        "가격후보": " / ".join(prices),
         "출처": source,
-        "주변내용": context[:1200],
+        "주변내용": context[:1500],
     })
 
 
-def _trace_item_relevant(text: str, source: str, item: str) -> Tuple[List[Dict[str, str]], bool]:
-    """
-    핵심 수정:
-    품목명이 있는 주변 구간에서만 42/45/4수 등을 직접 단서로 인정한다.
-    고구마를 검색했는데 양배추 시황의 42망이 뜨는 오탐을 막는다.
-    """
+def _scan_item_context(text: str, source: str, item: str):
     ranges = _item_windows(text, item)
     if item and not ranges:
         return [], False
 
     hits: List[Dict[str, str]] = []
+    patterns = _patterns_for_item(item)
+
     for a, b in ranges:
         segment = text[a:b]
-        for kind, pattern in (
-            ("망규격", TRACE_SIZE_RE),
-            ("4수/4개", TRACE_FOUR_RE),
-            ("필드+숫자", TRACE_FIELD_NUMBER_RE),
-        ):
-            for m in pattern.finditer(segment):
-                _trace_add(
-                    hits, source, kind, m.group(0),
-                    text, a + m.start(), a + m.end(), item
+        for kind, pat in patterns:
+            for m in pat.finditer(segment):
+                _add_hit(
+                    hits, source, item, kind, m.group(0),
+                    text, a + m.start(), a + m.end()
                 )
 
-        # 품목명 주변 [1]~[9] 내부코드 후보
-        bracket_re = re.compile(r"\[[1-9]\]")
-        for m in bracket_re.finditer(segment):
-            _trace_add(
-                hits, source, "숫자코드 후보", m.group(0),
-                text, a + m.start(), a + m.end(), item
+        # 품목 주변 숫자코드 후보
+        for m in re.finditer(r"\[[1-9]\]", segment):
+            _add_hit(
+                hits, source, item, "숫자코드 후보", m.group(0),
+                text, a + m.start(), a + m.end()
             )
 
-    uniq: List[Dict[str, str]] = []
+    # DOM 행/리스트 단위 보강: 품목과 규격이 같은 행에 있으면 직접 잡음
+    try:
+        soup = BeautifulSoup(text, "html.parser")
+        for tag in soup.find_all(["tr", "li", "article", "p"]):
+            row_text = tag.get_text(" ", strip=True)
+            if item and item.lower() not in row_text.lower():
+                continue
+            for kind, pat in patterns:
+                for m in pat.finditer(row_text):
+                    fake = row_text
+                    _add_hit(hits, source, item, kind, m.group(0), fake, m.start(), m.end())
+    except Exception:
+        pass
+
+    uniq = []
     seen = set()
     for row in hits:
         key = (row["종류"], row["일치"], row["출처"], row["주변내용"])
@@ -880,33 +958,24 @@ def _trace_item_relevant(text: str, source: str, item: str) -> Tuple[List[Dict[s
     return uniq, True
 
 
-def _schema_candidates(text: str, source: str) -> List[Dict[str, str]]:
-    """품목과 직접 연결되지 않은 사이트 구조/필드명은 별도 표시."""
+def _schema_candidates(text: str, source: str):
     rows = []
-    for m in TRACE_FIELD_RE.finditer(text):
-        left = max(0, m.start() - 110)
-        right = min(len(text), m.end() + 110)
+    for m in GENERIC_FIELD_RE.finditer(text):
+        left = max(0, m.start()-120)
+        right = min(len(text), m.end()+120)
         rows.append({
             "종류": "필드명",
             "일치": m.group(0),
             "출처": source,
-            "주변내용": _clean_context(text[left:right])[:700],
+            "주변내용": _clean_html_text(text[left:right])[:800],
         })
-        if len(rows) >= 120:
+        if len(rows) >= 100:
             break
-
-    uniq = []
-    seen = set()
-    for r in rows:
-        key = (r["일치"].lower(), r["주변내용"])
-        if key not in seen:
-            seen.add(key)
-            uniq.append(r)
-    return uniq
+    return rows
 
 
-def _discover_links(html_text: str, base_url: str, limit: int = 12) -> List[str]:
-    """같은 도메인의 시세/경매 관련 공개 링크만 1단계 후보로 뽑는다."""
+def _discover_links(html_text: str, base_url: str, item: str = "", limit: int = 16):
+    """같은 도메인의 시세/경매/품목 관련 링크 후보."""
     soup = BeautifulSoup(html_text, "html.parser")
     host = (urlparse(base_url).hostname or "").lower()
     scored = []
@@ -919,7 +988,12 @@ def _discover_links(html_text: str, base_url: str, limit: int = 12) -> List[str]
         if (urlparse(u).hostname or "").lower() != host:
             continue
         label = (a.get_text(" ", strip=True) + " " + u).lower()
-        score = sum(2 if w in label else 0 for w in DISCOVERY_WORDS)
+        score = 0
+        if item and item.lower() in label:
+            score += 20
+        score += sum(2 for w in DISCOVERY_WORDS if w.lower() in label)
+        if "view" in label or "detail" in label:
+            score += 1
         if score:
             scored.append((score, u))
 
@@ -935,209 +1009,413 @@ def _discover_links(html_text: str, base_url: str, limit: int = 12) -> List[str]
     return out
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def scan_public_trace(url: str, item: str, discover: bool = True) -> Dict[str, object]:
-    s = make_session()
+def _form_is_safe_search(form, base_url: str) -> bool:
+    method = (form.get("method") or "get").lower()
+    if method not in ("get", "post"):
+        return False
 
-    pages_to_scan = [url]
-    scanned_pages = []
-    all_hits: List[Dict[str, str]] = []
-    schema_rows: List[Dict[str, str]] = []
-    item_found_any = False
-    total_bytes = 0
-    js_scanned = 0
-    errors = []
+    action = urljoin(base_url, form.get("action") or base_url)
+    if not _same_host(action, base_url):
+        return False
 
-    first_html = ""
-    first_final = url
+    desc = (
+        action + " " + form.get_text(" ", strip=True) + " "
+        + " ".join(str(v) for tag in form.find_all(["input", "select"])
+                   for v in [tag.get("name", ""), tag.get("id", ""),
+                             tag.get("placeholder", ""), tag.get("type", "")])
+    ).lower()
 
-    for page_index in range(0, 8):
-        if page_index >= len(pages_to_scan):
-            break
-        page_url = pages_to_scan[page_index]
+    if any(w in desc for w in DANGEROUS_WORDS):
+        return False
+    if form.find("input", attrs={"type": re.compile(r"password|file", re.I)}):
+        return False
+
+    return any(w.lower() in desc for w in SEARCH_WORDS)
+
+
+def _choose_select_value(select_tag):
+    options = select_tag.find_all("option")
+    if not options:
+        return ""
+
+    # 제목/품목/전체 검색 계열을 우선
+    for opt in options:
+        txt = opt.get_text(" ", strip=True).lower()
+        val = opt.get("value", "")
+        if val and any(k in txt for k in ("품목", "제목", "전체", "상품", "title", "item", "name")):
+            return val
+
+    selected = select_tag.find("option", selected=True)
+    if selected is not None:
+        return selected.get("value", "")
+
+    for opt in options:
+        val = opt.get("value", "")
+        if val:
+            return val
+    return ""
+
+
+def _build_search_submission(form, base_url: str, item: str):
+    if not _form_is_safe_search(form, base_url):
+        return None
+
+    action = urljoin(base_url, form.get("action") or base_url)
+    method = (form.get("method") or "get").upper()
+    payload = {}
+    candidate_names = []
+
+    for inp in form.find_all("input"):
+        name = inp.get("name")
+        if not name:
+            continue
+        typ = (inp.get("type") or "text").lower()
+        if typ in {"submit", "button", "image", "reset", "file", "password"}:
+            continue
+        if typ in {"checkbox", "radio"} and not inp.has_attr("checked"):
+            continue
+        value = inp.get("value", "")
+        payload[name] = value
+
+        desc = " ".join([
+            name, inp.get("id", ""), inp.get("placeholder", ""),
+            inp.get("title", ""), inp.get("aria-label", "")
+        ]).lower()
+        if typ in {"text", "search", ""} and (
+            SEARCH_INPUT_RE.search(desc)
+            or any(w.lower() in desc for w in SEARCH_WORDS)
+        ):
+            candidate_names.append((name, desc))
+
+    for sel in form.find_all("select"):
+        name = sel.get("name")
+        if name:
+            payload[name] = _choose_select_value(sel)
+
+    if not candidate_names:
+        # 검색폼으로 판정됐는데 이름이 애매한 text input이 하나뿐이면 사용
+        texts = []
+        for inp in form.find_all("input"):
+            typ = (inp.get("type") or "text").lower()
+            name = inp.get("name")
+            if name and typ in {"text", "search", ""}:
+                texts.append(name)
+        if len(texts) == 1:
+            candidate_names = [(texts[0], texts[0])]
+
+    if not candidate_names:
+        return None
+
+    # 가장 검색스러운 입력칸 하나에 품목 입력
+    scored = []
+    for name, desc in candidate_names:
+        score = sum(1 for w in SEARCH_WORDS if w.lower() in desc)
+        if re.search(r'(?i)keyword|search|query|pum|item|product|name', desc):
+            score += 3
+        scored.append((score, name))
+    scored.sort(reverse=True)
+    payload[scored[0][1]] = item
+
+    return method, action, payload
+
+
+def _submit_search_forms(session, html_text: str, base_url: str, item: str, limit: int = 4):
+    """공개 검색폼만 실제 품목명으로 조회."""
+    soup = BeautifulSoup(html_text, "html.parser")
+    results = []
+    signatures = set()
+
+    for form in soup.find_all("form"):
+        sub = _build_search_submission(form, base_url, item)
+        if not sub:
+            continue
+        method, action, payload = sub
+        signature = (method, action, tuple(sorted(payload.items())))
+        if signature in signatures:
+            continue
+        signatures.add(signature)
+
         try:
-            r = _safe_public_get(s, page_url)
+            if method == "GET":
+                r = _safe_public_request(session, "GET", action, params=payload, timeout=18)
+            else:
+                r = _safe_public_request(session, "POST", action, data=payload, timeout=18)
             text = _decode_public_response(r)
-            final_url = r.url or page_url
-            scanned_pages.append(final_url)
+            results.append({
+                "url": r.url or action,
+                "html": text,
+                "method": method,
+                "action": action,
+                "payload": payload,
+            })
+        except Exception:
+            continue
+
+        if len(results) >= limit:
+            break
+
+    return results
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def deep_scan_public_site(start_url: str, item: str, deep: bool = True):
+    """
+    1) 시작페이지
+    2) 시세/경매 링크
+    3) 안전한 검색폼에 품목 입력
+    4) 검색결과에서 품목명 상세링크 추적
+    """
+    session = make_session()
+
+    queue = [(start_url, 0, "시작")]
+    seen_urls = set()
+    hits = []
+    schema = []
+    pages = []
+    errors = []
+    form_queries = []
+    detail_pages = 0
+    total_bytes = 0
+    item_found_any = False
+
+    max_pages = 24 if deep else 10
+    max_depth = 2 if deep else 1
+
+    while queue and len(pages) < max_pages:
+        url, depth, via = queue.pop(0)
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+
+        try:
+            r = _safe_public_get(session, url, timeout=18)
+            text = _decode_public_response(r)
+            final_url = r.url or url
             total_bytes += len(r.content)
+            pages.append({"url": final_url, "경로": via, "깊이": depth})
 
-            if page_index == 0:
-                first_html = text
-                first_final = final_url
-                if discover:
-                    for u in _discover_links(text, final_url, limit=12):
-                        if u not in pages_to_scan:
-                            pages_to_scan.append(u)
-
-            hits, item_found = _trace_item_relevant(text, final_url, item)
+            phits, item_found = _scan_item_context(text, final_url, item)
             if item_found:
                 item_found_any = True
-                all_hits.extend(hits)
-            schema_rows.extend(_schema_candidates(text, final_url))
+                hits.extend(phits)
+            schema.extend(_schema_candidates(text, final_url))
 
-            # 품목이 실제 페이지에 있는 경우에만 해당 페이지의 동일도메인 JS를 검사.
-            if item_found:
-                soup = BeautifulSoup(text, "html.parser")
-                base_host = (urlparse(final_url).hostname or "").lower()
-                script_urls = []
-                for script in soup.find_all("script", src=True):
-                    js_url = urljoin(final_url, script.get("src", ""))
-                    if (urlparse(js_url).hostname or "").lower() == base_host:
-                        script_urls.append(js_url)
+            # 공개 검색폼 자동 제출
+            if deep and depth <= 1:
+                submitted = _submit_search_forms(session, text, final_url, item, limit=4)
+                for sub in submitted:
+                    form_queries.append({
+                        "method": sub["method"],
+                        "action": sub["action"],
+                        "url": sub["url"],
+                    })
+                    stext = sub["html"]
+                    surl = sub["url"]
+                    shits, sfound = _scan_item_context(stext, surl, item)
+                    if sfound:
+                        item_found_any = True
+                        hits.extend(shits)
+                    schema.extend(_schema_candidates(stext, surl))
 
-                for js_url in list(dict.fromkeys(script_urls))[:6]:
-                    try:
-                        jr = _safe_public_get(s, js_url, timeout=10)
-                        js_text = _decode_public_response(jr)
-                        jhits, j_item_found = _trace_item_relevant(
-                            js_text, jr.url or js_url, item
-                        )
-                        if j_item_found:
-                            all_hits.extend(jhits)
-                        schema_rows.extend(_schema_candidates(js_text, jr.url or js_url))
-                        js_scanned += 1
-                    except Exception:
-                        continue
+                    if surl not in seen_urls:
+                        pages.append({"url": surl, "경로": "검색폼", "깊이": depth + 1})
+                        seen_urls.add(surl)
+                        total_bytes += len(stext.encode("utf-8", errors="ignore"))
+
+                    # 검색결과에서 품목명이 붙은 링크를 우선 상세 추적
+                    for link in _discover_links(stext, surl, item=item, limit=10):
+                        if link not in seen_urls and len(queue) + len(pages) < max_pages + 10:
+                            queue.insert(0, (link, min(depth+1, max_depth), "검색결과 상세"))
+                            detail_pages += 1
+
+            # 일반 시세/경매 관련 링크 탐색
+            if depth < max_depth:
+                for link in _discover_links(text, final_url, item=item, limit=14):
+                    if link not in seen_urls:
+                        queue.append((link, depth + 1, "관련링크"))
 
         except Exception as ex:
-            errors.append(f"{page_url} :: {ex}")
+            errors.append(f"{url} :: {ex}")
 
-    # 중복 제거
-    unique_hits = []
+    # dedupe
+    uniq_hits = []
     seen = set()
-    for row in all_hits:
+    for row in hits:
         key = (row["종류"], row["일치"], row["출처"], row["주변내용"])
         if key not in seen:
             seen.add(key)
-            unique_hits.append(row)
+            uniq_hits.append(row)
 
-    unique_schema = []
+    uniq_schema = []
     seen_schema = set()
-    for row in schema_rows:
+    for row in schema:
         key = (row["일치"].lower(), row["출처"], row["주변내용"])
         if key not in seen_schema:
             seen_schema.add(key)
-            unique_schema.append(row)
+            uniq_schema.append(row)
+
+    # 같은 사이트에서 너무 많은 일반 필드명은 잘라냄
+    uniq_schema = uniq_schema[:200]
 
     return {
-        "final_url": first_final,
         "item_found": item_found_any,
-        "html_bytes": total_bytes,
-        "js_scanned": js_scanned,
-        "pages_scanned": scanned_pages,
-        "hits": unique_hits,
-        "schema": unique_schema[:250],
+        "hits": uniq_hits,
+        "schema": uniq_schema,
+        "pages": pages,
         "errors": errors,
+        "form_queries": form_queries,
+        "detail_pages": detail_pages,
+        "bytes": total_bytes,
     }
 
 
-def _render_one_trace_result(label: str, result: Dict[str, object], item: str):
-    st.markdown(f"### {label}")
+def _merge_results(parts):
+    merged = {
+        "item_found": False,
+        "hits": [],
+        "schema": [],
+        "pages": [],
+        "errors": [],
+        "form_queries": [],
+        "detail_pages": 0,
+        "bytes": 0,
+    }
+    for r in parts:
+        merged["item_found"] = merged["item_found"] or r["item_found"]
+        for key in ("hits", "schema", "pages", "errors", "form_queries"):
+            merged[key].extend(r[key])
+        merged["detail_pages"] += r["detail_pages"]
+        merged["bytes"] += r["bytes"]
 
+    # pages/hits dedupe
+    pseen = set()
+    merged["pages"] = [
+        p for p in merged["pages"]
+        if not (p["url"] in pseen or pseen.add(p["url"]))
+    ]
+    hseen = set()
+    merged["hits"] = [
+        h for h in merged["hits"]
+        if not (
+            (h["종류"], h["일치"], h["출처"], h["주변내용"]) in hseen
+            or hseen.add((h["종류"], h["일치"], h["출처"], h["주변내용"]))
+        )
+    ]
+    qseen = set()
+    merged["form_queries"] = [
+        q for q in merged["form_queries"]
+        if not (
+            (q["method"], q["action"], q["url"]) in qseen
+            or qseen.add((q["method"], q["action"], q["url"]))
+        )
+    ]
+    return merged
+
+
+def _render_scan_result(label: str, result: Dict[str, object], item: str):
     hits = pd.DataFrame(result["hits"])
     schema = pd.DataFrame(result["schema"])
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("품목 직접단서", f"{len(hits):,}건")
-    c2.metric("검사 페이지", f'{len(result["pages_scanned"]):,}개')
-    c3.metric("검사 JS", f'{int(result["js_scanned"]):,}개')
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("직접단서", f"{len(hits):,}")
+    c2.metric("페이지", f'{len(result["pages"]):,}')
+    c3.metric("검색폼", f'{len(result["form_queries"]):,}')
+    c4.metric("오류", f'{len(result["errors"]):,}')
 
     if not result["item_found"]:
         st.warning(
-            f"검사한 공개 페이지에서 **{item}** 자체를 찾지 못했습니다. "
-            "따라서 다른 품목의 42망·45망은 결과에서 제외했습니다."
+            f"검사한 공개 응답에서 **{item}** 자체를 찾지 못했습니다. "
+            "다른 품목의 규격은 결과에 섞지 않았습니다."
         )
     elif hits.empty:
         st.info(
-            f"**{item}** 표기는 찾았지만 그 주변에서 42·45·4수 같은 직접 규격 흔적은 못 찾았습니다."
+            f"**{item}**은 찾았지만, 그 주변에서 현재 정의한 세부규격 직접단서는 못 찾았습니다."
         )
     else:
-        direct = hits[hits["종류"].isin(["망규격", "4수/4개", "필드+숫자"])]
-        code_candidates = hits[hits["종류"].isin(["숫자코드 후보"])]
+        st.subheader("🎯 품목과 연결된 직접 단서")
+        cols = ["품목", "종류", "일치", "가격후보", "출처", "주변내용"]
+        st.dataframe(hits[cols], use_container_width=True, hide_index=True)
 
-        if not direct.empty:
-            st.subheader("🎯 품목과 연결된 직접 단서")
-            st.dataframe(
-                direct[["품목", "종류", "일치", "가격후보", "출처", "주변내용"]],
-                use_container_width=True,
-                hide_index=True,
-            )
+    if result["form_queries"]:
+        with st.expander(f"실제로 조회한 공개 검색폼 {len(result['form_queries'])}건"):
+            st.dataframe(pd.DataFrame(result["form_queries"]), use_container_width=True, hide_index=True)
 
-        if not code_candidates.empty:
-            st.subheader("🧩 품목 주변 숫자코드 후보")
-            st.dataframe(
-                code_candidates[["품목", "종류", "일치", "가격후보", "출처", "주변내용"]],
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        with st.expander(f"품목 관련 전체 단서 {len(hits):,}건"):
-            st.dataframe(hits, use_container_width=True, hide_index=True)
+    if result["pages"]:
+        with st.expander(f"검사한 공개 페이지 {len(result['pages'])}개"):
+            st.dataframe(pd.DataFrame(result["pages"]), use_container_width=True, hide_index=True)
 
     if not schema.empty:
-        with st.expander(f"사이트 구조/필드 후보 {len(schema):,}건 (품목 직접증거 아님)"):
+        with st.expander(f"사이트 구조/필드 후보 {len(schema)}건 (직접규격 아님)"):
             st.dataframe(schema, use_container_width=True, hide_index=True)
 
     if result["errors"]:
-        with st.expander(f"접속 실패/건너뜀 {len(result['errors']):,}건"):
-            st.code("\n".join(result["errors"][:30]))
+        with st.expander(f"접속 실패/건너뜀 {len(result['errors'])}건"):
+            st.code("\n".join(result["errors"][:40]))
 
-    report_lines = [
+    lines = [
         f"법인: {label}",
         f"품목: {item}",
-        f"검사 페이지: {len(result['pages_scanned'])}",
-        f"품목 직접단서: {len(result['hits'])}",
+        f"직접단서: {len(result['hits'])}",
+        f"검사페이지: {len(result['pages'])}",
+        f"검색폼: {len(result['form_queries'])}",
         "",
     ]
-    for row in result["hits"]:
-        report_lines.append(
-            f'[{row["종류"]}] {row["일치"]} / 가격후보={row["가격후보"]}'
-        )
-        report_lines.append(row["출처"])
-        report_lines.append(row["주변내용"])
-        report_lines.append("")
+    for h in result["hits"]:
+        lines += [
+            f'[{h["종류"]}] {h["일치"]} / 가격후보={h["가격후보"]}',
+            h["출처"],
+            h["주변내용"],
+            "",
+        ]
 
     st.download_button(
         f"{label} 결과 TXT 저장",
-        data="\n".join(report_lines).encode("utf-8-sig"),
+        data="\n".join(lines).encode("utf-8-sig"),
         file_name=f"세부규격_{re.sub(r'[^0-9A-Za-z가-힣]+','_',label)}_{item}.txt",
         mime="text/plain",
         use_container_width=True,
-        key=f"trace_download::{label}::{item}",
+        key=f"v8download::{label}::{item}",
     )
 
 
 def render_trace_scanner():
-    st.title("🔍 세부규격 찾기")
+    st.title("🔍 세부규격 정밀찾기")
     st.caption(
-        "이제 **선택한 품목과 연결된 주변 내용만** 직접 단서로 인정합니다. "
-        "고구마를 검색했는데 양배추 42망이 뜨는 식의 오탐을 제외합니다."
+        "단순 홈페이지 검색이 아니라 **공개 검색폼에 품목을 실제 입력해 조회하고, "
+        "그 결과의 품목 상세페이지까지 따라가며** 세부규격 흔적을 찾습니다."
     )
 
     mode = st.radio(
         "검사 방식",
-        ["법인별 자동검사", "직접 주소 검사"],
+        ["법인별 정밀 자동검사", "직접 주소 정밀검사"],
         horizontal=True,
     )
+
     item = st.text_input(
         "찾을 품목",
         value="양배추",
         placeholder="예: 양배추, 고구마, 감자, 표고",
     ).strip()
 
-    if mode == "법인별 자동검사":
+    precision = st.toggle(
+        "정밀 모드",
+        value=True,
+        help="켜면 공개 검색폼 제출 + 관련 상세페이지를 최대 2단계까지 확인합니다.",
+    )
+
+    if mode == "법인별 정밀 자동검사":
         defaults = ["가락 · 대아청과", "가락 · 동화청과", "가락 · 중앙청과"]
         selected = st.multiselect(
             "검사할 법인",
             list(TRACE_COMPANIES.keys()),
             default=defaults,
         )
+
         st.caption(
-            "각 법인의 공개 사이트 시작점에서 시세·경매 관련 같은 도메인 링크를 최대 1단계까지 자동 탐색합니다."
+            "공개 페이지/공개 검색폼만 사용합니다. 로그인, 권한 우회, 비공개 주소 추측은 하지 않습니다."
         )
 
-        if st.button("선택 법인 검사", type="primary", use_container_width=True):
+        if st.button("선택 법인 정밀검사", type="primary", use_container_width=True):
             if not item:
                 st.error("품목을 입력해 주세요.")
                 return
@@ -1147,110 +1425,71 @@ def render_trace_scanner():
 
             results = []
             progress = st.progress(0.0)
-            status_box = st.empty()
+            status = st.empty()
 
             for idx, label in enumerate(selected, start=1):
-                status_box.caption(f"{label} 검사 중...")
-                corp = TRACE_COMPANIES[label]
-
-                # 시작 URL 여러 개 중 가장 단서가 많은 결과를 대표로 사용하되,
-                # 모든 시작점 결과를 합쳐서 보여준다.
-                merged = {
-                    "final_url": corp["urls"][0],
-                    "item_found": False,
-                    "html_bytes": 0,
-                    "js_scanned": 0,
-                    "pages_scanned": [],
-                    "hits": [],
-                    "schema": [],
-                    "errors": [],
-                }
-
-                for start_url in corp["urls"]:
+                status.caption(f"{label} · {item} 검색폼/상세페이지 검사 중...")
+                parts = []
+                for start_url in TRACE_COMPANIES[label]["urls"]:
                     try:
-                        r = scan_public_trace(start_url, item, discover=True)
-                        merged["item_found"] = merged["item_found"] or r["item_found"]
-                        merged["html_bytes"] += r["html_bytes"]
-                        merged["js_scanned"] += r["js_scanned"]
-                        merged["pages_scanned"].extend(r["pages_scanned"])
-                        merged["hits"].extend(r["hits"])
-                        merged["schema"].extend(r["schema"])
-                        merged["errors"].extend(r["errors"])
+                        parts.append(deep_scan_public_site(start_url, item, deep=precision))
                     except Exception as ex:
-                        merged["errors"].append(f"{start_url} :: {ex}")
-
-                # merge dedupe
-                pseen = set()
-                merged["pages_scanned"] = [
-                    x for x in merged["pages_scanned"]
-                    if not (x in pseen or pseen.add(x))
-                ]
-                hseen = set()
-                merged["hits"] = [
-                    x for x in merged["hits"]
-                    if not (
-                        (x["종류"], x["일치"], x["출처"], x["주변내용"]) in hseen
-                        or hseen.add((x["종류"], x["일치"], x["출처"], x["주변내용"]))
-                    )
-                ]
-                results.append((label, merged))
+                        parts.append({
+                            "item_found": False, "hits": [], "schema": [], "pages": [],
+                            "errors": [f"{start_url} :: {ex}"], "form_queries": [],
+                            "detail_pages": 0, "bytes": 0,
+                        })
+                results.append((label, _merge_results(parts)))
                 progress.progress(idx / len(selected))
 
-            status_box.empty()
+            status.empty()
             progress.empty()
 
-            # 먼저 요약표
-            summary_rows = []
+            summary = []
             for label, r in results:
-                summary_rows.append({
+                summary.append({
                     "법인": label,
-                    "접속": "✅" if r["pages_scanned"] else "❌",
+                    "접속": "✅" if r["pages"] else "❌",
                     "품목발견": "✅" if r["item_found"] else "—",
                     "직접단서": len(r["hits"]),
-                    "검사페이지": len(r["pages_scanned"]),
+                    "검색폼": len(r["form_queries"]),
+                    "검사페이지": len(r["pages"]),
                     "오류": len(r["errors"]),
                 })
-            st.subheader("법인별 결과")
-            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+            st.subheader("법인별 정밀 결과")
+            st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
 
             for label, r in results:
                 with st.expander(
-                    f'{label} · 직접단서 {len(r["hits"])}건',
+                    f'{label} · 직접단서 {len(r["hits"])}건 · 검색폼 {len(r["form_queries"])}건',
                     expanded=(len(r["hits"]) > 0),
                 ):
-                    _render_one_trace_result(label, r, item)
+                    _render_scan_result(label, r, item)
 
     else:
-        url = st.text_input(
-            "공개 페이지 주소",
-            placeholder="https://...",
-        ).strip()
-        st.caption(
-            "공개 HTML·공개 JS 및 같은 도메인의 시세/경매 링크만 검사합니다. "
-            "로그인/권한 우회는 하지 않습니다."
-        )
-
-        if st.button("주소 검사", type="primary", use_container_width=True):
+        url = st.text_input("공개 페이지 주소", placeholder="https://...").strip()
+        if st.button("주소 정밀검사", type="primary", use_container_width=True):
             if not item:
                 st.error("품목을 입력해 주세요.")
                 return
             if not url:
-                st.error("페이지 주소를 넣어 주세요.")
+                st.error("주소를 입력해 주세요.")
                 return
 
-            with st.spinner("품목과 연결된 세부규격 흔적 찾는 중..."):
+            with st.spinner("공개 검색폼과 상세페이지까지 검사 중..."):
                 try:
-                    result = scan_public_trace(url, item, discover=True)
+                    result = deep_scan_public_site(url, item, deep=precision)
                 except Exception as ex:
-                    st.error("이 공개 페이지를 가져오지 못했습니다.")
+                    st.error("이 공개 사이트를 검사하지 못했습니다.")
                     st.code(str(ex))
                     return
-
-            _render_one_trace_result("직접 주소", result, item)
+            _render_scan_result("직접 주소", result, item)
 
     st.info(
-        "핵심: `[1]~[6]` 같은 숫자코드는 42/45망으로 자동 해석하지 않습니다. "
-        "같은 품목 주변에서 실제 규격명이 연결되는 증거가 있어야 매핑합니다."
+        "품목별로 찾는 단서를 분리했습니다. 예: 양배추=42/45망·4수, "
+        "고구마=긴특·긴상·공중·공하 등, 표고=C/T·P-BOX·PP대. "
+        "다른 품목의 규격은 결과에 섞지 않습니다."
     )
 
 
