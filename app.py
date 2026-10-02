@@ -525,6 +525,8 @@ def render_company(company: Dict[str, str], date_yyyymmdd: str, item: str) -> pd
                         height=min(430, 42 + 35 * min(len(view), 11)),
                     )
 
+    render_integrated_spec_v11(company, date_yyyymmdd, item)
+
     with st.expander("이 법인 원자료 전체 보기"):
         raw_view = df[
             ["시장", "법인", "번호", "품목(품종)", "단위", "등급", "경락가", "출하지"]
@@ -1502,6 +1504,7 @@ def render_trace_scanner():
 MAFRA_API_HOST = "http://211.237.50.150:7080/openapi"
 
 MAFRA_SERVICES = {
+    "settlement": "Grid_20240625000000000653_1",  # 정산 가격 정보: STD/SIZENAME/LVNAME
     "live": "Grid_20240625000000000654_1",     # 도매시장 실시간 경락 정보
     "raw": "Grid_20240625000000000655_1",      # 도매시장 원천데이터 정산 가격
     "market": "Grid_20240625000000000661_1",   # 도매시장 코드
@@ -1810,6 +1813,256 @@ def _get_secret_api_key() -> str:
         return str(st.secrets.get("MAFRA_API_KEY", "") or "")
     except Exception:
         return ""
+
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def mafra_fetch_settlement_market(
+    api_key: str,
+    sale_date: str,
+    market_code: str,
+    max_rows: int = 5000,
+) -> Tuple[List[Dict[str, str]], int]:
+    service = MAFRA_SERVICES["settlement"]
+    params = {"SALEDATE": sale_date, "WHSALCD": market_code}
+    rows = []
+    start = 1
+    total = 0
+    while start <= max_rows:
+        end = min(start + 999, max_rows)
+        part, total = _mafra_request_xml(
+            api_key, service, start, end, params=params, timeout=35
+        )
+        rows.extend(part)
+        if not part or len(rows) >= total:
+            break
+        start = end + 1
+    return rows, total
+
+
+def _normalize_company_name_v11(name: str) -> str:
+    text = re.sub(r"\s+", "", str(name or ""))
+    for token in ("(주)", "㈜", "주식회사", "농협경제지주", "농협중앙회"):
+        text = text.replace(token, "")
+    return re.sub(r"[()（）·\-_]", "", text).lower()
+
+
+def _company_score_v11(public_name: str, official_name: str, market_name: str) -> int:
+    a = _normalize_company_name_v11(public_name)
+    b = _normalize_company_name_v11(official_name)
+    if not a or not b:
+        return 0
+    if a == b:
+        return 100
+    if a in b or b in a:
+        return 85
+
+    for key in ("서울청과", "중앙청과", "동화청과", "한국청과", "대아청과", "서부청과", "강서청과"):
+        k = key.lower()
+        if k in a and k in b:
+            return 95
+
+    if "농협" in a and "농협" in b:
+        if market_name == "가락" and "가락" in b:
+            return 95
+        if market_name == "강서" and "강서" in b:
+            return 95
+        return 40
+    return 0
+
+
+def _settlement_df_v11(rows: List[Dict[str, str]]) -> pd.DataFrame:
+    data = []
+    for r in rows:
+        data.append({
+            "장일자": r.get("SALEDATE", ""),
+            "시장코드": r.get("WHSALCD", ""),
+            "시장": r.get("WHSALNAME", ""),
+            "법인코드": r.get("CMPCD", ""),
+            "법인": r.get("CMPNAME", ""),
+            "부류": r.get("LARGENAME", ""),
+            "품목": r.get("MIDNAME", ""),
+            "품종": r.get("SMALLNAME", ""),
+            "단량": _num(r.get("DANQ", ""), 0),
+            "공개규격": r.get("STD", ""),
+            "크기/규격": r.get("SIZENAME", ""),
+            "등급": r.get("LVNAME", ""),
+            "산지": r.get("SANNAME", ""),
+            "총물량": _num(r.get("TOTQTY", ""), 0),
+            "최저": _num(r.get("MINAMT", ""), 0),
+            "최고": _num(r.get("MAXAMT", ""), 0),
+            "평균": _num(r.get("AVGAMT", ""), 0),
+        })
+    return pd.DataFrame(data)
+
+
+def _official_market_code_v11(market_name: str) -> str:
+    return {"가락": "110001", "강서": "110008"}.get(market_name, "")
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def integrated_spec_v11(
+    api_key: str,
+    sale_date: str,
+    market_name: str,
+    public_company_name: str,
+    item_keyword: str,
+) -> Dict[str, object]:
+    market_code = _official_market_code_v11(market_name)
+    if not market_code:
+        return {"summary": pd.DataFrame(), "raw": pd.DataFrame(), "message": "지원하지 않는 시장입니다."}
+
+    # 1) official settlement summary: directly exposes SIZENAME/LVNAME/STD
+    rows, total = mafra_fetch_settlement_market(api_key, sale_date, market_code)
+    sdf = _settlement_df_v11(rows)
+    if sdf.empty:
+        return {"summary": pd.DataFrame(), "raw": pd.DataFrame(), "message": "공식 정산자료가 아직 없습니다."}
+
+    sdf = _item_filter(sdf, item_keyword, ["품목", "품종", "부류"])
+    if sdf.empty:
+        return {"summary": pd.DataFrame(), "raw": pd.DataFrame(), "message": "공식 정산자료에서 해당 품목을 찾지 못했습니다."}
+
+    scores = {
+        n: _company_score_v11(public_company_name, n, market_name)
+        for n in sdf["법인"].dropna().astype(str).unique()
+    }
+    best = max(scores.values()) if scores else 0
+    if best <= 0:
+        return {
+            "summary": pd.DataFrame(),
+            "raw": pd.DataFrame(),
+            "message": "선택 법인과 공식 법인명을 연결하지 못했습니다.",
+            "official_names": list(scores.keys()),
+        }
+
+    matched_names = [n for n, score in scores.items() if score == best]
+    sdf = sdf[sdf["법인"].isin(matched_names)].copy()
+    corp_codes = [x for x in sdf["법인코드"].dropna().astype(str).unique() if x]
+
+    # 2) raw auction rows: actual COST/QTY + SIZECD/LVCD/POJCD
+    raw_frames = []
+    if corp_codes:
+        grade_map = mafra_code_map(api_key, "grade")
+        unit_map = mafra_code_map(api_key, "unit")
+        pack_map = mafra_code_map(api_key, "pack")
+        size_map = mafra_code_map(api_key, "size")
+
+        for corp_code in corp_codes[:3]:
+            raw_rows, _ = mafra_fetch_raw_company(
+                api_key, sale_date, market_code, corp_code
+            )
+            if not raw_rows:
+                continue
+            rdf = _raw_to_dataframe(
+                raw_rows,
+                market_name,
+                matched_names[0],
+                grade_map,
+                unit_map,
+                pack_map,
+                size_map,
+            )
+            rdf = _item_filter(rdf, item_keyword, ["품목", "품종"])
+            if not rdf.empty:
+                raw_frames.append(rdf)
+
+    raw = pd.concat(raw_frames, ignore_index=True) if raw_frames else pd.DataFrame()
+    return {
+        "summary": sdf,
+        "raw": raw,
+        "message": "",
+        "matched_names": matched_names,
+        "settlement_total": total,
+    }
+
+
+def render_integrated_spec_v11(
+    company: Dict[str, str],
+    date_yyyymmdd: str,
+    item: str,
+):
+    if not bool(st.session_state.get("main_spec_enrich_enabled", False)):
+        return
+
+    st.markdown("### 🧩 확인된 세부규격")
+    api_key = str(st.session_state.get("main_mafra_api_key", "") or "").strip()
+    if not api_key:
+        st.info("위 `세부규격 자동보강 설정`에 공식 API 키를 넣으면 여기에 규격이 붙습니다.")
+        return
+
+    try:
+        with st.spinner("공식 원천데이터에서 같은 장일자·법인·품목 규격 확인 중..."):
+            result = integrated_spec_v11(
+                api_key, date_yyyymmdd, company["market"], company["name"], item
+            )
+    except Exception as e:
+        st.warning("공식 원천데이터 보강에 실패했습니다.")
+        st.code(str(e))
+        return
+
+    raw = result.get("raw", pd.DataFrame())
+    summary = result.get("summary", pd.DataFrame())
+    if raw.empty and summary.empty:
+        st.info(result.get("message", "") or "확인된 규격자료가 없습니다.")
+        return
+
+    names = result.get("matched_names", [])
+    if names:
+        st.caption(
+            "공식 법인명: " + ", ".join(names) +
+            " · 같은 장일자/시장/법인/품목 기준. 공사 모바일 행과 임의로 1:1 짝짓지는 않습니다."
+        )
+
+    if not raw.empty:
+        st.success(f"실제 원천 거래 {len(raw):,}건의 포장·크기·등급을 확인했습니다.")
+        summary_raw = _summary_from_decoded(raw)
+        if not summary_raw.empty:
+            st.dataframe(
+                summary_raw.style.format({
+                    "물량": "{:,.2f}",
+                    "머리": "{:,.0f}",
+                    "중간": "{:,.0f}",
+                    "꼬리": "{:,.0f}",
+                    "평균": "{:,.0f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with st.expander("세부규격 확인된 실제 원천 거래행"):
+            cols = [
+                "시장", "법인", "품목", "품종", "규격표시", "등급",
+                "물량", "경락가", "산지", "낙찰시간",
+                "크기코드", "등급코드", "포장코드",
+            ]
+            st.dataframe(
+                raw[cols].sort_values(
+                    ["품종", "규격표시", "등급", "경락가"],
+                    ascending=[True, True, True, False],
+                ).style.format({"물량": "{:,.2f}", "경락가": "{:,.0f}"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    if not summary.empty:
+        with st.expander("공식 정산 규격 요약", expanded=raw.empty):
+            cols = [
+                "법인", "품목", "품종", "단량", "공개규격",
+                "크기/규격", "등급", "산지", "총물량", "최저", "최고", "평균",
+            ]
+            st.dataframe(
+                summary[cols].sort_values(
+                    ["품종", "공개규격", "크기/규격", "등급", "최고"],
+                    ascending=[True, True, True, True, False],
+                ).style.format({
+                    "총물량": "{:,.2f}",
+                    "최저": "{:,.0f}",
+                    "최고": "{:,.0f}",
+                    "평균": "{:,.0f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 def render_grade_decoder():
@@ -2186,7 +2439,7 @@ if mode == "🔍 세부규격 찾기":
     st.stop()
 
 st.title("가락·강서 경매조회")
-st.caption("장일자 + 품목 검색 → 법인 상태 확인 → 원하는 법인 선택 → 머리·중간·꼬리 확인")
+st.caption("장일자 + 품목 → 실제 경매결과 → 확인되는 경우 포장·크기·등급까지 자동보강")
 
 default_item = qp_get("item", "")
 default_date = parse_default_date(qp_get("date", ""))
@@ -2213,6 +2466,32 @@ market_scope = st.multiselect(
     default=default_markets,
     help="둘 다 선택하면 가락·강서에서 경매결과가 있는 법인을 함께 찾습니다.",
 )
+
+with st.expander("🧩 세부규격 자동보강 설정", expanded=False):
+    secret_key = _get_secret_api_key()
+    current_key = str(st.session_state.get("main_mafra_api_key", "") or secret_key)
+
+    enrich_toggle = st.toggle(
+        "경매결과 아래에 공식 세부규격 붙이기",
+        value=bool(st.session_state.get("main_spec_enrich_enabled", False)),
+        key="main_spec_enrich_widget",
+    )
+    api_key_input = st.text_input(
+        "농림축산식품 공공데이터 API 키",
+        value=current_key,
+        type="password",
+        placeholder="발급받은 키",
+        help="키는 채팅에 보내지 말고 여기 입력하세요.",
+        key="main_mafra_api_key_widget",
+    ).strip()
+
+    st.session_state["main_spec_enrich_enabled"] = enrich_toggle
+    st.session_state["main_mafra_api_key"] = api_key_input
+
+    if enrich_toggle and api_key_input:
+        st.success("자동보강 ON · 경매결과 아래에 확인된 규격을 붙입니다.")
+    elif enrich_toggle:
+        st.warning("자동보강 ON · API 키를 입력해야 실제 보강이 시작됩니다.")
 
 search_clicked = st.button("경매 법인 찾기", type="primary", use_container_width=True)
 
