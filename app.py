@@ -3442,6 +3442,244 @@ def _fav_signature_v19(favorites: List[str]) -> str:
     return "|".join(_clean_favorites_v18(favorites))
 
 
+
+@st.cache_data(ttl=60, show_spinner=False)
+def favorite_status_v20(
+    date_yyyymmdd: str,
+    favorites: Tuple[str, ...],
+    markets: Tuple[str, ...],
+) -> List[Dict[str, object]]:
+    """
+    즐겨찾기 상태를 일반 '직접 품목 검색'과 같은 방식으로 확인한다.
+
+    핵심:
+    - 시장 전체(s_bubin='') 1회 조회를 쓰지 않는다.
+    - 실제 법인 목록을 가져와 favorite × 법인 조합에 대해 probe_company()를 호출한다.
+    - 따라서 직접 '아스파라거스' 검색에서 서울청과가 잡히면
+      즐겨찾기에서도 동일하게 서울청과가 잡혀야 한다.
+    """
+    candidates: List[Dict[str, str]] = []
+    for market_name in markets:
+        try:
+            _, opts = get_market_context(market_name)
+            candidates.extend(opts)
+        except Exception:
+            continue
+
+    results: Dict[str, Dict[str, object]] = {
+        item: {
+            "item": item,
+            "available": False,
+            "markets": [],
+            "company_labels": [],
+            "company_count": 0,
+            "rows": 0,
+        }
+        for item in favorites
+    }
+
+    jobs = [(item, c) for item in favorites for c in candidates]
+    if not jobs:
+        return [results[item] for item in favorites]
+
+    # 중첩 ThreadPool 대신 한 번에 favorite × 법인을 병렬 확인.
+    workers = min(12, max(1, len(jobs)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        future_map = {
+            ex.submit(
+                probe_company,
+                date_yyyymmdd,
+                item,
+                c["market"],
+                c["code"],
+            ): (item, c)
+            for item, c in jobs
+        }
+
+        for fut in as_completed(future_map):
+            item, c = future_map[fut]
+            try:
+                count = int(fut.result())
+            except Exception:
+                count = 0
+
+            if count <= 0:
+                continue
+
+            slot = results[item]
+            slot["available"] = True
+            slot["rows"] += count
+
+            if c["market"] not in slot["markets"]:
+                slot["markets"].append(c["market"])
+
+            label = f'{c["market"]} · {c["name"]}'
+            if label not in slot["company_labels"]:
+                slot["company_labels"].append(label)
+
+    for item in favorites:
+        slot = results[item]
+        slot["markets"] = sorted(slot["markets"])
+        slot["company_labels"] = sorted(slot["company_labels"])
+        slot["company_count"] = len(slot["company_labels"])
+
+    return [results[item] for item in favorites]
+
+
+def render_favorites_v20(
+    date_yyyymmdd: str,
+    markets: Tuple[str, ...],
+):
+    st.divider()
+    st.subheader("⭐ 즐겨찾기 빠른조회")
+    st.caption(
+        "직접 품목 검색과 **같은 법인별 조회 방식**으로 확인합니다. "
+        "그래서 직접 검색에서 잡히는 법인은 즐겨찾기에서도 동일하게 잡히도록 맞췄습니다."
+    )
+
+    favorites = load_favorites_v18()
+    st.session_state["favorites_v18"] = favorites
+
+    with st.expander("⭐ 즐겨찾기 관리", expanded=False):
+        new_item = st.text_input(
+            "품목 추가",
+            placeholder="예: 표고, 상추, 아스파라거스",
+            key="fav_add_v20",
+        ).strip()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("➕ 추가", use_container_width=True, key="fav_add_btn_v20"):
+                if new_item:
+                    updated = _clean_favorites_v18(favorites + [new_item])
+                    save_favorites_v18(updated)
+                    status_key = _fav_status_state_key_v19(date_yyyymmdd, markets)
+                    st.session_state.pop(status_key, None)
+                    favorite_status_v20.clear()
+                    st.rerun()
+        with c2:
+            if st.button("기본값", use_container_width=True, key="fav_reset_btn_v20"):
+                save_favorites_v18(list(DEFAULT_FAVORITES_V18))
+                status_key = _fav_status_state_key_v19(date_yyyymmdd, markets)
+                st.session_state.pop(status_key, None)
+                favorite_status_v20.clear()
+                st.rerun()
+
+        remove_items = st.multiselect(
+            "삭제할 품목",
+            options=favorites,
+            key="fav_remove_v20",
+        )
+        if st.button(
+            "🗑 선택 삭제",
+            use_container_width=True,
+            disabled=not remove_items,
+            key="fav_remove_btn_v20",
+        ):
+            updated = [x for x in favorites if x not in set(remove_items)]
+            save_favorites_v18(updated)
+            status_key = _fav_status_state_key_v19(date_yyyymmdd, markets)
+            st.session_state.pop(status_key, None)
+            favorite_status_v20.clear()
+            st.rerun()
+
+    if not favorites:
+        st.info("즐겨찾기 품목을 하나 이상 추가해 주세요.")
+        return
+
+    status_key = _fav_status_state_key_v19(date_yyyymmdd, markets)
+    fav_signature = _fav_signature_v19(favorites)
+
+    check_col, meta_col = st.columns([1.25, 2.2])
+    with check_col:
+        run_check = st.button(
+            "⚡ 오늘 경매여부 확인",
+            type="primary",
+            use_container_width=True,
+            key=f"fav_check_v20::{date_yyyymmdd}::{','.join(markets)}",
+        )
+    with meta_col:
+        st.caption(
+            f"{date_yyyymmdd[:4]}-{date_yyyymmdd[4:6]}-{date_yyyymmdd[6:8]} · "
+            + " + ".join(markets)
+            + f" · 즐겨찾기 {len(favorites)}개"
+        )
+
+    if run_check:
+        try:
+            with st.spinner("즐겨찾기 품목을 법인별로 확인 중..."):
+                statuses = favorite_status_v20(
+                    date_yyyymmdd,
+                    tuple(favorites),
+                    tuple(markets),
+                )
+            st.session_state[status_key] = {
+                "signature": fav_signature,
+                "statuses": statuses,
+            }
+        except Exception as e:
+            st.error("즐겨찾기 조회 중 오류가 발생했습니다.")
+            st.code(str(e))
+            st.session_state.pop(status_key, None)
+            return
+
+    cached = st.session_state.get(status_key)
+    if not isinstance(cached, dict) or cached.get("signature") != fav_signature:
+        st.info("즐겨찾기 추가/수정 후 **오늘 경매여부 확인**을 눌러 주세요.")
+        st.markdown("**현재 즐겨찾기:** " + " · ".join(favorites))
+        return
+
+    statuses = cached.get("statuses") or []
+    any_available = False
+
+    for idx, row in enumerate(statuses):
+        item = str(row.get("item", ""))
+        available = bool(row.get("available", False))
+        company_labels = list(row.get("company_labels", []))
+        company_count = int(row.get("company_count", 0))
+        any_available = any_available or available
+
+        if available:
+            label = f"✅ {item} · {company_count}법인"
+            help_text = "오늘 결과 있음 · 눌러서 해당 품목 법인선택으로 이동"
+        else:
+            # ⏳ 대신 '미확인'으로 표시해 '아직 로딩 중'과 혼동하지 않도록 함.
+            label = f"— {item} · 미확인"
+            help_text = "현재 선택 시장/장일자에서 결과가 확인되지 않음"
+
+        clicked = st.button(
+            label,
+            disabled=not available,
+            type="primary" if available else "secondary",
+            use_container_width=True,
+            help=help_text,
+            key=f"fav_pick_v20::{date_yyyymmdd}::{item}",
+        )
+
+        if available and company_labels:
+            st.caption("확인 법인: " + " · ".join(company_labels))
+
+        if clicked and available:
+            st.session_state["search"] = {
+                "date": date_yyyymmdd,
+                "item": item,
+                "markets": tuple(markets),
+            }
+            st.session_state.pop("favorites_request_v19", None)
+            st.session_state.pop("favorites_request_v18", None)
+            st.session_state.pop("item_picker_request_v16", None)
+
+            for k in list(st.session_state.keys()):
+                if str(k).startswith("corp_selected::"):
+                    st.session_state.pop(k, None)
+
+            qp_set(date=date_yyyymmdd, item=item, markets=",".join(markets))
+            st.rerun()
+
+    if not any_available:
+        st.info("현재 즐겨찾기 중 오늘 경매결과가 확인된 품목이 없습니다.")
+
+
 def render_favorites_v19(
     date_yyyymmdd: str,
     markets: Tuple[str, ...],
@@ -3675,8 +3913,8 @@ if mode == "🔍 세부규격 찾기":
     st.stop()
 
 st.title("가락·강서 경매조회")
-st.caption("✅ APP VERSION: v19-FAVORITES-STABLE")
-st.caption("즐겨찾기 추가는 즉시 저장만 · `오늘 경매여부 확인`을 눌렀을 때만 조회")
+st.caption("✅ APP VERSION: v20-FAVORITES-DIRECT-MATCH")
+st.caption("즐겨찾기도 직접 품목검색과 동일한 법인별 조회 방식으로 확인")
 
 default_item = qp_get("item", "")
 default_date = parse_default_date(qp_get("date", ""))
@@ -3763,7 +4001,7 @@ if search_clicked:
 # 품목을 비워 검색한 경우: 즐겨찾기 추가와 조회를 분리
 if "favorites_request_v19" in st.session_state:
     fav_req = st.session_state["favorites_request_v19"]
-    render_favorites_v19(
+    render_favorites_v20(
         fav_req["date"],
         tuple(fav_req["markets"]),
     )
