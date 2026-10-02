@@ -3,11 +3,12 @@ import math
 import re
 import ipaddress
 import socket
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 from statistics import mean
 from typing import Dict, List, Tuple
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, quote, unquote
 
 import pandas as pd
 import requests
@@ -1494,6 +1495,650 @@ def render_trace_scanner():
 
 
 
+
+# =========================================================
+# 농림축산식품부 도매시장 원천데이터 - "등외 해체" 엔진
+# =========================================================
+MAFRA_API_HOST = "http://211.237.50.150:7080/openapi"
+
+MAFRA_SERVICES = {
+    "live": "Grid_20240625000000000654_1",     # 도매시장 실시간 경락 정보
+    "raw": "Grid_20240625000000000655_1",      # 도매시장 원천데이터 정산 가격
+    "market": "Grid_20240625000000000661_1",   # 도매시장 코드
+    "corp": "Grid_20240626000000000662_1",     # 법인 코드
+    "grade": "Grid_20240626000000000663_1",    # 등급 코드
+    "unit": "Grid_20240626000000000664_1",     # 단위 코드
+    "pack": "Grid_20240626000000000665_1",     # 포장 코드
+    "size": "Grid_20240626000000000666_1",     # 크기 코드
+    "item": "Grid_20240626000000000668_1",     # 품목 코드
+}
+
+SEOUL_WHOLESALE_MARKETS = {
+    "가락 · 서울가락": "110001",
+    "강서 · 서울강서": "110008",
+}
+
+
+def _mafra_key_path(api_key: str) -> str:
+    # 이미 URL-encoded 된 키를 붙여 넣어도 한 번 풀었다가 안전하게 재인코딩
+    key = unquote((api_key or "").strip())
+    return quote(key, safe="")
+
+
+def _xml_rows_and_meta(text: str):
+    try:
+        root = ET.fromstring(text)
+    except Exception as e:
+        raise RuntimeError(f"API XML 해석 실패: {e}")
+
+    result = root.find("result")
+    if result is not None:
+        code = (result.findtext("code") or "").strip()
+        message = (result.findtext("message") or "").strip()
+        if code and code != "INFO-000":
+            raise RuntimeError(f"{code}: {message or 'API 오류'}")
+
+    total_text = (root.findtext("totalCnt") or "0").strip()
+    try:
+        total = int(float(total_text))
+    except Exception:
+        total = 0
+
+    rows = []
+    for row in root.findall("row"):
+        d = {}
+        for child in list(row):
+            d[child.tag] = (child.text or "").strip()
+        rows.append(d)
+    return rows, total
+
+
+def _mafra_request_xml(
+    api_key: str,
+    service: str,
+    start: int,
+    end: int,
+    params: Dict[str, str] | None = None,
+    timeout: int = 25,
+):
+    key_path = _mafra_key_path(api_key)
+    url = f"{MAFRA_API_HOST}/{key_path}/xml/{service}/{start}/{end}"
+
+    session = make_session()
+    try:
+        r = session.get(url, params=params or {}, timeout=timeout)
+        r.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        raise RuntimeError(
+            "농식품 공공데이터 API 접속 실패. "
+            "Streamlit Cloud가 211.237.50.150:7080 연결을 막는 경우가 있습니다. "
+            f"원인: {e}"
+        )
+
+    return _xml_rows_and_meta(_decode_public_response(r))
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def mafra_code_map(api_key: str, service_key: str) -> Dict[str, str]:
+    service = MAFRA_SERVICES[service_key]
+    first_rows, total = _mafra_request_xml(api_key, service, 1, 1000)
+
+    rows = list(first_rows)
+    start = 1001
+    while start <= total and start <= 10000:
+        end = min(start + 999, total)
+        part, _ = _mafra_request_xml(api_key, service, start, end)
+        rows.extend(part)
+        start = end + 1
+
+    result = {}
+    for row in rows:
+        code = str(row.get("CODEID", "")).strip()
+        name = str(row.get("CODENAME", "")).strip()
+        if code:
+            result[code] = name
+    return result
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def mafra_fetch_raw_company(
+    api_key: str,
+    sale_date: str,
+    market_code: str,
+    corp_code: str,
+    max_rows: int = 6000,
+) -> Tuple[List[Dict[str, str]], int]:
+    service = MAFRA_SERVICES["raw"]
+    params = {
+        "SALEDATE": sale_date,
+        "WHSALCD": market_code,
+        "CMPCD": corp_code,
+    }
+
+    rows = []
+    start = 1
+    total = 0
+    while start <= max_rows:
+        end = min(start + 999, max_rows)
+        part, total = _mafra_request_xml(api_key, service, start, end, params=params, timeout=35)
+        rows.extend(part)
+
+        if not part or len(rows) >= total:
+            break
+        start = end + 1
+
+    return rows, total
+
+
+@st.cache_data(ttl=90, show_spinner=False)
+def mafra_fetch_live_company(
+    api_key: str,
+    sale_date: str,
+    market_code: str,
+    corp_code: str,
+    max_rows: int = 5000,
+) -> Tuple[List[Dict[str, str]], int]:
+    service = MAFRA_SERVICES["live"]
+    params = {
+        "SALEDATE": sale_date,
+        "WHSALCD": market_code,
+        "CMPCD": corp_code,
+    }
+
+    rows = []
+    start = 1
+    total = 0
+    while start <= max_rows:
+        end = min(start + 999, max_rows)
+        part, total = _mafra_request_xml(api_key, service, start, end, params=params, timeout=30)
+        rows.extend(part)
+
+        if not part or len(rows) >= total:
+            break
+        start = end + 1
+
+    return rows, total
+
+
+def _num(v, default=0):
+    try:
+        if v is None or str(v).strip() == "":
+            return default
+        return float(str(v).replace(",", ""))
+    except Exception:
+        return default
+
+
+def _int_if_whole(v):
+    n = _num(v, 0)
+    if float(n).is_integer():
+        return int(n)
+    return n
+
+
+def _code_name(code_map: Dict[str, str], code: str, unknown_prefix: str = "코드") -> str:
+    c = str(code or "").strip()
+    if not c:
+        return "-"
+    return code_map.get(c, f"{unknown_prefix}:{c}")
+
+
+def _raw_to_dataframe(
+    rows: List[Dict[str, str]],
+    market_name: str,
+    corp_name: str,
+    grade_map: Dict[str, str],
+    unit_map: Dict[str, str],
+    pack_map: Dict[str, str],
+    size_map: Dict[str, str],
+) -> pd.DataFrame:
+    data = []
+
+    for r in rows:
+        unit_name = _code_name(unit_map, r.get("DANCD", ""), "단위")
+        pack_name = _code_name(pack_map, r.get("POJCD", ""), "포장")
+        size_name = _code_name(size_map, r.get("SIZECD", ""), "크기")
+        grade_name = _code_name(grade_map, r.get("LVCD", ""), "등급")
+
+        danq = str(r.get("DANQ", "")).strip()
+        parts = []
+        if danq and danq not in {"0", "0.0"}:
+            parts.append(f"{danq}{'' if unit_name == '-' else unit_name}")
+        elif unit_name != "-":
+            parts.append(unit_name)
+        if pack_name != "-":
+            parts.append(pack_name)
+        if size_name != "-":
+            parts.append(size_name)
+
+        data.append({
+            "장일자": r.get("SALEDATE", ""),
+            "시장": market_name,
+            "법인": corp_name,
+            "원표": r.get("SEQ", ""),
+            "경매순서": r.get("NO1", ""),
+            "품목": r.get("PUMNAME", ""),
+            "품종": r.get("GOODNAME", ""),
+            "단량": _num(r.get("DANQ", ""), 0),
+            "단위": unit_name,
+            "포장": pack_name,
+            "크기/규격": size_name,
+            "등급": grade_name,
+            "규격표시": " ".join(parts).strip() or "-",
+            "물량": _num(r.get("QTY", ""), 0),
+            "경락가": _num(r.get("COST", ""), 0),
+            "산지": r.get("SANNAME", ""),
+            "낙찰시간": r.get("SBIDTIME", ""),
+            "매매방법코드": r.get("MMCD", ""),
+            "크기코드": r.get("SIZECD", ""),
+            "등급코드": r.get("LVCD", ""),
+            "포장코드": r.get("POJCD", ""),
+            "단위코드": r.get("DANCD", ""),
+        })
+
+    return pd.DataFrame(data)
+
+
+def _live_to_dataframe(rows: List[Dict[str, str]]) -> pd.DataFrame:
+    data = []
+    for r in rows:
+        data.append({
+            "장일자": r.get("SALEDATE", ""),
+            "시장": r.get("WHSALNAME", ""),
+            "법인": r.get("CMPNAME", ""),
+            "부류": r.get("LARGENAME", ""),
+            "품목": r.get("MIDNAME", ""),
+            "품종": r.get("SMALLNAME", ""),
+            "공개규격": r.get("STD", ""),
+            "물량": _num(r.get("QTY", ""), 0),
+            "경락가": _num(r.get("COST", ""), 0),
+            "산지": r.get("SANNAME", ""),
+            "낙찰시간": r.get("SBIDTIME", ""),
+        })
+    return pd.DataFrame(data)
+
+
+def _item_filter(df: pd.DataFrame, keyword: str, cols: List[str]) -> pd.DataFrame:
+    if df.empty or not keyword:
+        return df
+    kw = keyword.strip()
+    mask = pd.Series(False, index=df.index)
+    for c in cols:
+        if c in df.columns:
+            mask = mask | df[c].astype(str).str.contains(re.escape(kw), case=False, na=False)
+    return df[mask].copy()
+
+
+def _is_nonstandard_grade(name: str) -> bool:
+    text = str(name or "").strip()
+    if text in {"특", "상", "보통"}:
+        return False
+    return True
+
+
+def _summary_from_decoded(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    rows = []
+    group_cols = ["시장", "법인", "품목", "품종", "규격표시", "등급"]
+
+    for keys, g in df.groupby(group_cols, dropna=False, sort=False):
+        prices = [int(round(x)) for x in g["경락가"].tolist() if _num(x, 0) > 0]
+        if not prices:
+            continue
+        rows.append({
+            "시장": keys[0],
+            "법인": keys[1],
+            "품목": keys[2],
+            "품종": keys[3],
+            "규격": keys[4],
+            "등급": keys[5],
+            "건수": len(g),
+            "물량": round(g["물량"].sum(), 2),
+            "머리": max(prices),
+            "중간": actual_middle_price(prices),
+            "꼬리": min(prices),
+            "평균": round(mean(prices)),
+        })
+
+    return pd.DataFrame(rows)
+
+
+def _get_secret_api_key() -> str:
+    try:
+        return str(st.secrets.get("MAFRA_API_KEY", "") or "")
+    except Exception:
+        return ""
+
+
+def render_grade_decoder():
+    st.title("🧩 등외 해체")
+    st.caption(
+        "농림축산식품부 **도매시장 원천데이터**의 단위·포장·크기·등급 코드를 따로 해석합니다. "
+        "공사 화면의 `등외`만 보는 대신 실제 원천의 `크기/규격`을 분리해서 비교합니다."
+    )
+
+    source_mode = st.radio(
+        "데이터",
+        ["원천 정산 · 등급+크기 해체", "실시간 경락 · 공개규격 확인"],
+        horizontal=True,
+    )
+
+    saved_key = _get_secret_api_key()
+    api_key = st.text_input(
+        "농림축산식품 공공데이터 API 키",
+        value=saved_key,
+        type="password",
+        placeholder="data.mafra.go.kr에서 발급받은 키",
+        help="키는 채팅에 보내지 말고 이 입력칸 또는 Streamlit secrets의 MAFRA_API_KEY에 넣으세요.",
+    ).strip()
+
+    if not api_key:
+        st.info(
+            "이 기능은 공식 원천 API 키가 필요합니다. "
+            "농림축산식품 공공데이터포털에서 `도매시장 원천데이터 정산 가격` OpenAPI를 신청한 뒤 키를 입력하세요."
+        )
+        st.code(
+            'Streamlit secrets 예시\n\nMAFRA_API_KEY = "여기에_발급키"',
+            language="toml",
+        )
+        return
+
+    col1, col2 = st.columns([1, 1.35])
+    with col1:
+        query_date = st.date_input("장일자", value=date.today(), key="mafra_decoder_date")
+    with col2:
+        keyword = st.text_input(
+            "품목",
+            value="양배추",
+            placeholder="예: 양배추, 고구마, 감자, 표고, 오이",
+            key="mafra_decoder_item",
+        ).strip()
+
+    market_labels = st.multiselect(
+        "시장",
+        list(SEOUL_WHOLESALE_MARKETS.keys()),
+        default=list(SEOUL_WHOLESALE_MARKETS.keys()),
+        key="mafra_decoder_markets",
+    )
+
+    if not market_labels:
+        st.warning("가락 또는 강서를 하나 이상 선택해 주세요.")
+        return
+
+    try:
+        with st.spinner("공식 코드표 확인 중..."):
+            corp_map = mafra_code_map(api_key, "corp")
+    except Exception as e:
+        st.error("농림축산식품 공공데이터 API 키 또는 연결을 확인해 주세요.")
+        st.code(str(e))
+        return
+
+    market_codes = [SEOUL_WHOLESALE_MARKETS[x] for x in market_labels]
+
+    corps = []
+    for market_label, market_code in zip(market_labels, market_codes):
+        market_short = market_label.split(" · ")[0]
+        for code, name in corp_map.items():
+            # 법인코드는 공식 샘플처럼 시장코드+2자리 형태가 일반적.
+            if code.startswith(market_code):
+                corps.append({
+                    "label": f"{market_short} · {name}",
+                    "market_label": market_short,
+                    "market_code": market_code,
+                    "corp_code": code,
+                    "corp_name": name,
+                })
+
+    # 혹시 코드 prefix가 다르게 오는 경우를 대비해 전체 법인 검색도 가능하게
+    if not corps:
+        st.warning(
+            "공식 법인코드표에서 선택 시장과 연결되는 법인을 자동 식별하지 못했습니다. "
+            "코드표 구조가 바뀌었을 수 있습니다."
+        )
+        return
+
+    corp_options = [x["label"] for x in corps]
+    selected_corp_labels = st.multiselect(
+        "법인",
+        corp_options,
+        default=corp_options,
+        key="mafra_decoder_corps",
+        help="처음에는 전체 법인을 두고 비교해도 됩니다. 데이터가 많으면 필요한 법인만 선택하세요.",
+    )
+
+    selected_corps = [x for x in corps if x["label"] in selected_corp_labels]
+
+    if not selected_corps:
+        st.warning("법인을 하나 이상 선택해 주세요.")
+        return
+
+    if source_mode.startswith("원천 정산"):
+        grade_scope = st.radio(
+            "등급 범위",
+            ["특/상/보통 외만", "전체 등급"],
+            horizontal=True,
+            help="`특/상/보통 외만`은 4등·5등·등외·없음·기타·미상 등을 모두 잡습니다.",
+        )
+
+        run = st.button("원천 규격 해체", type="primary", use_container_width=True)
+        if not run:
+            st.caption(
+                "정산 원천자료는 실시간 화면보다 늦게 확정될 수 있습니다. "
+                "대신 단위·포장·크기·등급이 별도 코드로 있어 가장 정확하게 해체할 수 있습니다."
+            )
+            return
+
+        try:
+            with st.spinner("단위·포장·크기·등급 코드표 불러오는 중..."):
+                grade_map = mafra_code_map(api_key, "grade")
+                unit_map = mafra_code_map(api_key, "unit")
+                pack_map = mafra_code_map(api_key, "pack")
+                size_map = mafra_code_map(api_key, "size")
+        except Exception as e:
+            st.error("공식 코드표를 불러오지 못했습니다.")
+            st.code(str(e))
+            return
+
+        sale_date = query_date.strftime("%Y%m%d")
+        frames = []
+        truncated = []
+
+        progress = st.progress(0.0)
+        status = st.empty()
+
+        def fetch_one(c):
+            rows, total = mafra_fetch_raw_company(
+                api_key, sale_date, c["market_code"], c["corp_code"]
+            )
+            frame = _raw_to_dataframe(
+                rows,
+                c["market_label"],
+                c["corp_name"],
+                grade_map,
+                unit_map,
+                pack_map,
+                size_map,
+            )
+            return c, frame, total, len(rows)
+
+        with ThreadPoolExecutor(max_workers=min(4, len(selected_corps))) as ex:
+            futures = {ex.submit(fetch_one, c): c for c in selected_corps}
+            done = 0
+            for fut in as_completed(futures):
+                c = futures[fut]
+                try:
+                    c2, frame, total, fetched = fut.result()
+                    if total > fetched:
+                        truncated.append(f'{c2["label"]}: {fetched:,}/{total:,}건')
+                    frames.append(frame)
+                except Exception as e:
+                    st.warning(f'{c["label"]} 조회 실패: {e}')
+                done += 1
+                progress.progress(done / len(selected_corps))
+                status.caption(f"{done}/{len(selected_corps)} 법인 조회")
+
+        progress.empty()
+        status.empty()
+
+        if not frames:
+            st.warning("가져온 원천 정산자료가 없습니다.")
+            return
+
+        df = pd.concat(frames, ignore_index=True)
+        df = _item_filter(df, keyword, ["품목", "품종"])
+
+        if grade_scope == "특/상/보통 외만" and not df.empty:
+            df = df[df["등급"].map(_is_nonstandard_grade)].copy()
+
+        if df.empty:
+            st.info(
+                "선택한 장일자·품목·법인에서 조건에 맞는 원천 거래를 찾지 못했습니다. "
+                "당일 자료가 아직 정산 전이면 `실시간 경락 · 공개규격 확인`을 사용해 보세요."
+            )
+            return
+
+        st.success(f"원천 거래 {len(df):,}건에서 규격/등급을 분리했습니다.")
+
+        if truncated:
+            st.warning("일부 법인은 안전 상한까지만 불러왔습니다: " + " · ".join(truncated))
+
+        summary = _summary_from_decoded(df)
+
+        if not summary.empty:
+            st.subheader("규격별 경쟁가")
+            st.caption("같은 `등외`라도 포장·크기/규격이 다르면 별도 행으로 분리합니다.")
+            st.dataframe(
+                summary.style.format({
+                    "물량": "{:,.2f}",
+                    "머리": "{:,.0f}",
+                    "중간": "{:,.0f}",
+                    "꼬리": "{:,.0f}",
+                    "평균": "{:,.0f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.subheader("원천 거래행")
+        view_cols = [
+            "시장", "법인", "품목", "품종", "규격표시", "등급",
+            "물량", "경락가", "산지", "낙찰시간",
+            "크기코드", "등급코드", "포장코드",
+        ]
+        st.dataframe(
+            df[view_cols].sort_values(
+                ["법인", "품목", "품종", "규격표시", "등급", "경락가"],
+                ascending=[True, True, True, True, True, False],
+            ).style.format({"물량": "{:,.2f}", "경락가": "{:,.0f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        csv_data = df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "등외 해체 원천 CSV 저장",
+            data=csv_data,
+            file_name=f"등외해체_{sale_date}_{keyword or '전체'}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    else:
+        run = st.button("실시간 공개규격 조회", type="primary", use_container_width=True)
+        if not run:
+            st.caption(
+                "실시간 API는 법인·품목·산지·경락가·물량과 `STD(규격)`를 제공합니다. "
+                "정산 원천의 SIZECD/LVCD처럼 완전히 분리되지는 않지만 경매 직후 확인용으로 빠릅니다."
+            )
+            return
+
+        sale_date = query_date.strftime("%Y%m%d")
+        frames = []
+
+        progress = st.progress(0.0)
+        status = st.empty()
+
+        def fetch_live_one(c):
+            rows, total = mafra_fetch_live_company(
+                api_key, sale_date, c["market_code"], c["corp_code"]
+            )
+            return c, _live_to_dataframe(rows), total
+
+        with ThreadPoolExecutor(max_workers=min(4, len(selected_corps))) as ex:
+            futures = {ex.submit(fetch_live_one, c): c for c in selected_corps}
+            done = 0
+            for fut in as_completed(futures):
+                c = futures[fut]
+                try:
+                    _, frame, _ = fut.result()
+                    frames.append(frame)
+                except Exception as e:
+                    st.warning(f'{c["label"]} 실시간 조회 실패: {e}')
+                done += 1
+                progress.progress(done / len(selected_corps))
+                status.caption(f"{done}/{len(selected_corps)} 법인 조회")
+
+        progress.empty()
+        status.empty()
+
+        if not frames:
+            st.warning("실시간 경락자료가 없습니다.")
+            return
+
+        df = pd.concat(frames, ignore_index=True)
+        df = _item_filter(df, keyword, ["품목", "품종", "부류"])
+
+        if df.empty:
+            st.info("선택한 조건의 실시간 거래가 아직 없습니다.")
+            return
+
+        st.success(f"실시간 거래 {len(df):,}건")
+        st.dataframe(
+            df.sort_values(["법인", "공개규격", "경락가"], ascending=[True, True, False])
+            .style.format({"물량": "{:,.0f}", "경락가": "{:,.0f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        # 규격별 머리/중간/꼬리
+        rows = []
+        for keys, g in df.groupby(["시장", "법인", "품목", "품종", "공개규격"], dropna=False):
+            prices = [int(round(x)) for x in g["경락가"].tolist() if _num(x, 0) > 0]
+            if not prices:
+                continue
+            rows.append({
+                "시장": keys[0],
+                "법인": keys[1],
+                "품목": keys[2],
+                "품종": keys[3],
+                "규격": keys[4],
+                "건수": len(g),
+                "머리": max(prices),
+                "중간": actual_middle_price(prices),
+                "꼬리": min(prices),
+                "평균": round(mean(prices)),
+            })
+
+        if rows:
+            st.subheader("실시간 규격별 가격")
+            sdf = pd.DataFrame(rows)
+            st.dataframe(
+                sdf.style.format({
+                    "머리": "{:,.0f}", "중간": "{:,.0f}",
+                    "꼬리": "{:,.0f}", "평균": "{:,.0f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.info(
+            "실시간 `STD`가 `10kg 상자`까지만 내려오면 그 시점 공개 실시간 자료에는 크기값이 없는 것입니다. "
+            "정산 후에는 원천자료의 `SIZECD`와 공식 크기코드표로 다시 확인할 수 있습니다."
+        )
+
+
 # =========================================================
 # URL 상태
 # =========================================================
@@ -1527,10 +2172,14 @@ def parse_default_date(raw: str) -> date:
 # =========================================================
 mode = st.radio(
     "기능",
-    ["📊 경매조회", "🔍 세부규격 찾기"],
+    ["📊 경매조회", "🧩 등외 해체", "🔍 세부규격 찾기"],
     horizontal=True,
     label_visibility="collapsed",
 )
+
+if mode == "🧩 등외 해체":
+    render_grade_decoder()
+    st.stop()
 
 if mode == "🔍 세부규격 찾기":
     render_trace_scanner()
