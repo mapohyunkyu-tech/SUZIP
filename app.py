@@ -540,6 +540,143 @@ def render_company(company: Dict[str, str], date_yyyymmdd: str, item: str) -> pd
     return df
 
 
+
+# =========================================================
+# v14: 선택 법인 즉시 비교표
+# =========================================================
+def _cmp_unit_v14(v: str) -> str:
+    t = re.sub(r"\s+", "", str(v or "")).lower()
+    m = re.search(r"(\d+(?:\.\d+)?)(kg|g)", t, flags=re.I)
+    if not m:
+        return t or "-"
+    n = float(m.group(1))
+    ns = str(int(n)) if n.is_integer() else str(n).rstrip("0").rstrip(".")
+    return f"{ns}{m.group(2).lower()}"
+
+
+def _cmp_grade_v14(v: str) -> str:
+    t = re.sub(r"\s+", "", str(v or ""))
+    if not t or t in {"-", "없음", "미상", "무등급"} or "등외" in t or "기타" in t:
+        return "세부규격 미확인"
+    return t
+
+
+def _comparison_rows_v14(frames: List[pd.DataFrame], search_item: str) -> pd.DataFrame:
+    if not frames:
+        return pd.DataFrame()
+    all_df = pd.concat(frames, ignore_index=True)
+    need = {"시장", "법인", "품목(품종)", "단위", "등급", "경락가"}
+    if not need.issubset(set(all_df.columns)):
+        return pd.DataFrame()
+    all_df = all_df.copy()
+    all_df["비교단위"] = all_df["단위"].map(_cmp_unit_v14)
+    all_df["비교등급"] = all_df["등급"].map(_cmp_grade_v14)
+    out = []
+    for (u, gr), gg in all_df.groupby(["비교단위", "비교등급"], dropna=False, sort=False):
+        corp_count = gg[["시장", "법인"]].drop_duplicates().shape[0]
+        if corp_count < 2:
+            continue
+        for (mkt, corp), cg in gg.groupby(["시장", "법인"], sort=False):
+            prices = []
+            for x in cg["경락가"].tolist():
+                try:
+                    if pd.notna(x) and float(x) > 0:
+                        prices.append(int(round(float(x))))
+                except Exception:
+                    pass
+            if not prices:
+                continue
+            out.append({
+                "검색품목": search_item,
+                "비교단위": u,
+                "비교등급": gr,
+                "법인": f"{mkt} · {corp}",
+                "품종표기": " / ".join(list(dict.fromkeys(cg["품목(품종)"].astype(str).tolist()))[:4]),
+                "원등급": " / ".join(list(dict.fromkeys(cg["등급"].astype(str).tolist()))[:4]),
+                "건수": len(prices),
+                "머리": max(prices),
+                "중간": actual_middle_price(prices),
+                "꼬리": min(prices),
+                "평균": round(mean(prices)),
+            })
+    return pd.DataFrame(out)
+
+
+def _fallback_compare_v14(frames: List[pd.DataFrame], search_item: str) -> pd.DataFrame:
+    if not frames:
+        return pd.DataFrame()
+    all_df = pd.concat(frames, ignore_index=True)
+    out = []
+    for (mkt, corp), g in all_df.groupby(["시장", "법인"], sort=False):
+        prices = []
+        for x in g["경락가"].tolist():
+            try:
+                if pd.notna(x) and float(x) > 0:
+                    prices.append(int(round(float(x))))
+            except Exception:
+                pass
+        if prices:
+            out.append({
+                "법인": f"{mkt} · {corp}",
+                "검색품목": search_item,
+                "품종표기": " / ".join(list(dict.fromkeys(g["품목(품종)"].astype(str).tolist()))[:5]),
+                "건수": len(prices),
+                "머리": max(prices),
+                "중간": actual_middle_price(prices),
+                "꼬리": min(prices),
+                "평균": round(mean(prices)),
+            })
+    return pd.DataFrame(out)
+
+
+def render_compare_v14(frames: List[pd.DataFrame], selected_labels: List[str], search_item: str):
+    st.markdown("## 📊 선택 법인 비교")
+    st.caption("v14 비교모드 · 법인 2곳 이상 선택 시 이 영역은 항상 표시됩니다.")
+    if not frames:
+        st.error("선택 법인의 비교용 경매자료를 불러오지 못했습니다.")
+        return
+    cdf = _comparison_rows_v14(frames, search_item)
+    if cdf.empty:
+        st.warning("공통 단위·등급 그룹이 없어 법인별 전체 요약으로 비교합니다.")
+        fb = _fallback_compare_v14(frames, search_item)
+        if not fb.empty:
+            st.dataframe(
+                fb.style.format({
+                    "건수": "{:,.0f}", "머리": "{:,.0f}", "중간": "{:,.0f}",
+                    "꼬리": "{:,.0f}", "평균": "{:,.0f}"
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+        return
+    order = {x: idx for idx, x in enumerate(selected_labels)}
+    cdf["순서"] = cdf["법인"].map(order).fillna(9999).astype(int)
+    for (u, gr), g in cdf.groupby(["비교단위", "비교등급"], sort=False):
+        g = g.sort_values(["순서", "중간"]).copy()
+        base = None
+        base_label = None
+        for lab in selected_labels:
+            r = g[g["법인"] == lab]
+            if not r.empty:
+                base = int(r.iloc[0]["중간"])
+                base_label = lab
+                break
+        g["중간차이"] = g["중간"].astype(int) - (base if base is not None else 0)
+        st.markdown(f"### {search_item} · {u} · {gr}")
+        view = g[["법인", "품종표기", "원등급", "건수", "머리", "중간", "중간차이", "꼬리", "평균"]].copy()
+        st.dataframe(
+            view.style.format({
+                "건수": "{:,.0f}", "머리": "{:,.0f}", "중간": "{:,.0f}",
+                "중간차이": "{:+,.0f}", "꼬리": "{:,.0f}", "평균": "{:,.0f}"
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if base_label:
+            st.caption(f"중간차이 기준: {base_label}")
+        if gr == "세부규격 미확인":
+            st.warning("⚠ 공개결과상 세부규격 미확인. 42/45망, 4내/4수 등이 섞였을 수 있어 참고가격 비교로 보세요.")
+
 def build_excel_bytes(selected_frames: List[pd.DataFrame]) -> bytes:
     all_df = pd.concat(selected_frames, ignore_index=True)
 
@@ -2439,7 +2576,8 @@ if mode == "🔍 세부규격 찾기":
     st.stop()
 
 st.title("가락·강서 경매조회")
-st.caption("장일자 + 품목 → 실제 경매결과 → 확인되는 경우 포장·크기·등급까지 자동보강")
+st.caption("✅ APP VERSION: v14-COMPARE-FIX")
+st.caption("장일자 + 품목 → 법인 2곳 이상 선택 → 비교표를 선택 문구 바로 아래 표시")
 
 default_item = qp_get("item", "")
 default_date = parse_default_date(qp_get("date", ""))
@@ -2664,6 +2802,22 @@ if not selected_labels:
     st.stop()
 
 label_to_company = company_by_label
+
+# v14: 선택 문구 바로 아래에 비교표를 먼저 출력
+if len(selected_labels) >= 2:
+    st.markdown("### 🔎 v14 비교표 준비")
+    compare_frames: List[pd.DataFrame] = []
+    with st.spinner("선택한 법인들의 경매자료를 비교 중..."):
+        for label in selected_labels:
+            c = label_to_company[label]
+            df_cmp = fetch_all_company_rows(
+                search["date"], search["item"], c["market"], c["code"]
+            )
+            if not df_cmp.empty:
+                df_cmp = df_cmp.copy()
+                df_cmp.insert(1, "법인", c["name"])
+                compare_frames.append(df_cmp)
+    render_compare_v14(compare_frames, selected_labels, search["item"])
 
 st.divider()
 
