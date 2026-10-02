@@ -5,7 +5,7 @@ import ipaddress
 import socket
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from statistics import mean
 from typing import Dict, List, Tuple
 from urllib.parse import urljoin, urlparse, quote, unquote
@@ -393,6 +393,202 @@ def fetch_all_company_rows(
     return pd.DataFrame(all_rows, columns=cols)
 
 
+
+# =========================================================
+# v16: 품목 미입력 시 오늘 진행된 경매 품목 탐색
+# =========================================================
+def _base_item_name_v16(raw_name: str) -> str:
+    """
+    공개 경매결과의 '품목(품종)' 표기에서 품목 선택용 이름을 만든다.
+    예: '양배추(양배추일반)' -> '양배추'
+    괄호가 없으면 원문을 그대로 사용한다.
+    """
+    text = re.sub(r"\s+", " ", str(raw_name or "")).strip()
+    if not text:
+        return ""
+    base = re.sub(r"\s*[\(\（][^\)\）]*[\)\）]\s*$", "", text).strip()
+    return base or text
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def discover_today_items_v16(
+    date_yyyymmdd: str,
+    markets: Tuple[str, ...],
+) -> List[Dict[str, object]]:
+    """
+    품목을 비운 상태로 각 법인의 당일 경매결과를 조회해,
+    실제로 결과가 올라온 품목만 모은다.
+
+    반환:
+      item       : 다시 검색할 품목명
+      raw_names  : 실제 공개 품목(품종) 표기
+      rows       : 확인된 거래행 수
+      companies  : 결과가 확인된 법인 수
+      markets    : 확인된 시장
+    """
+    candidates: List[Dict[str, str]] = []
+    for market_name in markets:
+        _, opts = get_market_context(market_name)
+        candidates.extend(opts)
+
+    # 품목별 집계
+    agg: Dict[str, Dict[str, object]] = {}
+
+    def fetch_candidate(c: Dict[str, str]):
+        # 빈 품목으로 해당 법인의 오늘 결과 전체를 페이지 끝까지 조회
+        df = fetch_all_company_rows(
+            date_yyyymmdd,
+            "",
+            c["market"],
+            c["code"],
+            max_pages=100,
+        )
+        return c, df
+
+    workers = min(8, max(1, len(candidates)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        future_map = {ex.submit(fetch_candidate, c): c for c in candidates}
+
+        for fut in as_completed(future_map):
+            c = future_map[fut]
+            try:
+                c2, df = fut.result()
+            except Exception:
+                continue
+
+            if df is None or df.empty:
+                continue
+
+            company_label = f'{c2["market"]} · {c2["name"]}'
+
+            for raw_name, g in df.groupby("품목(품종)", sort=False):
+                item_name = _base_item_name_v16(raw_name)
+                if not item_name:
+                    continue
+
+                slot = agg.setdefault(
+                    item_name,
+                    {
+                        "item": item_name,
+                        "raw_names": set(),
+                        "rows": 0,
+                        "company_labels": set(),
+                        "market_names": set(),
+                    },
+                )
+                slot["raw_names"].add(str(raw_name))
+                slot["rows"] += int(len(g))
+                slot["company_labels"].add(company_label)
+                slot["market_names"].add(c2["market"])
+
+    out: List[Dict[str, object]] = []
+    for item_name, slot in agg.items():
+        out.append(
+            {
+                "item": item_name,
+                "raw_names": sorted(slot["raw_names"]),
+                "rows": int(slot["rows"]),
+                "companies": len(slot["company_labels"]),
+                "company_labels": sorted(slot["company_labels"]),
+                "markets": sorted(slot["market_names"]),
+            }
+        )
+
+    # 거래행 많은 품목 우선, 같은 건수면 이름순
+    out.sort(key=lambda x: (-int(x["rows"]), str(x["item"])))
+    return out
+
+
+def render_today_item_picker_v16(
+    date_yyyymmdd: str,
+    markets: Tuple[str, ...],
+):
+    st.divider()
+    st.subheader("🥕 오늘 진행된 경매 품목")
+    st.caption(
+        "품목을 비워서 검색했기 때문에, 선택한 장일자에 실제 경매결과가 올라온 품목을 먼저 찾습니다. "
+        "품목을 고르면 그 품목 기준으로 다시 법인 선택 화면으로 넘어갑니다."
+    )
+
+    reload_col, info_col = st.columns([1, 2.4])
+    with reload_col:
+        if st.button(
+            "🔄 품목 새로고침",
+            use_container_width=True,
+            key=f"today_items_reload::{date_yyyymmdd}::{','.join(markets)}",
+        ):
+            discover_today_items_v16.clear()
+            fetch_all_company_rows.clear()
+            st.rerun()
+    with info_col:
+        st.caption(
+            f"{date_yyyymmdd[:4]}-{date_yyyymmdd[4:6]}-{date_yyyymmdd[6:8]} · "
+            + " + ".join(markets)
+        )
+
+    with st.spinner("오늘 진행된 품목을 법인별 경매결과에서 모으는 중..."):
+        items = discover_today_items_v16(date_yyyymmdd, tuple(markets))
+
+    if not items:
+        st.warning(
+            "현재 확인되는 경매 품목이 없습니다. 아직 경매결과가 올라오지 않았거나, "
+            "공개 경매조회가 빈 품목 조회를 허용하지 않는 경우입니다."
+        )
+        return
+
+    st.success(f"현재 확인된 품목 {len(items):,}개")
+
+    option_labels = []
+    by_label = {}
+    for x in items:
+        market_text = "/".join(x["markets"])
+        label = (
+            f'{x["item"]}  ·  {x["rows"]:,}건  ·  '
+            f'{x["companies"]}법인  ·  {market_text}'
+        )
+        option_labels.append(label)
+        by_label[label] = x
+
+    selected_label = st.selectbox(
+        "품목 선택",
+        options=option_labels,
+        index=None,
+        placeholder="눌러서 오늘 경매된 품목을 선택하세요",
+        key=f"today_item_select::{date_yyyymmdd}::{','.join(markets)}",
+    )
+
+    if selected_label:
+        x = by_label[selected_label]
+        with st.expander("이 품목이 확인된 법인/표기"):
+            st.write("법인:", " · ".join(x["company_labels"]))
+            st.write("공개 품목표기:", " / ".join(x["raw_names"]))
+
+        if st.button(
+            f'✅ {x["item"]} 선택하고 법인 다시 찾기',
+            type="primary",
+            use_container_width=True,
+            key=f'choose_today_item::{date_yyyymmdd}::{x["item"]}',
+        ):
+            st.session_state["search"] = {
+                "date": date_yyyymmdd,
+                "item": str(x["item"]),
+                "markets": tuple(markets),
+            }
+            st.session_state.pop("item_picker_request_v16", None)
+
+            # 같은 날짜라도 이전 품목에서 선택한 법인이 새 품목으로 넘어오지 않도록 정리
+            for k in list(st.session_state.keys()):
+                if str(k).startswith("corp_selected::"):
+                    st.session_state.pop(k, None)
+
+            qp_set(
+                date=date_yyyymmdd,
+                item=str(x["item"]),
+                markets=",".join(markets),
+            )
+            st.rerun()
+
+
 # =========================================================
 # 표시 / 계산
 # =========================================================
@@ -676,6 +872,428 @@ def render_compare_v14(frames: List[pd.DataFrame], selected_labels: List[str], s
             st.caption(f"중간차이 기준: {base_label}")
         if gr == "세부규격 미확인":
             st.warning("⚠ 공개결과상 세부규격 미확인. 42/45망, 4내/4수 등이 섞였을 수 있어 참고가격 비교로 보세요.")
+
+
+# =========================================================
+# v15: 시세 약세 / 우리만 약세 진단
+# - '시장 전체'라고 단정하지 않고 선택한 타 법인 기준으로 진단
+# - 오늘 타 법인 중간가 vs 최근 3/5장 타 법인 일별 중간가 평균
+# - 우리 오늘 중간가 vs 오늘 타 법인 중간가
+# =========================================================
+def _group_stats_v15(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    work = df.copy()
+    work["비교단위"] = work["단위"].map(_cmp_unit_v14)
+    work["비교등급"] = work["등급"].map(_cmp_grade_v14)
+
+    rows = []
+    for (u, gr), g in work.groupby(["비교단위", "비교등급"], dropna=False, sort=False):
+        prices = []
+        for x in g["경락가"].tolist():
+            try:
+                if pd.notna(x) and float(x) > 0:
+                    prices.append(int(round(float(x))))
+            except Exception:
+                pass
+        if not prices:
+            continue
+
+        rows.append({
+            "법인": label,
+            "비교단위": u,
+            "비교등급": gr,
+            "품종표기": " / ".join(
+                list(dict.fromkeys(g["품목(품종)"].astype(str).tolist()))[:5]
+            ),
+            "건수": len(prices),
+            "중간": actual_middle_price(prices),
+            "머리": max(prices),
+            "꼬리": min(prices),
+            "평균": round(mean(prices)),
+        })
+    return pd.DataFrame(rows)
+
+
+def _selected_frame_map_v15(
+    frames: List[pd.DataFrame],
+) -> Dict[str, pd.DataFrame]:
+    out: Dict[str, pd.DataFrame] = {}
+    for df in frames:
+        if df is None or df.empty:
+            continue
+        try:
+            market_name = str(df.iloc[0]["시장"])
+            corp_name = str(df.iloc[0]["법인"])
+            label = f"{market_name} · {corp_name}"
+            out[label] = df
+        except Exception:
+            continue
+    return out
+
+
+def _fetch_company_frame_v15(
+    company: Dict[str, str],
+    ymd: str,
+    item: str,
+) -> pd.DataFrame:
+    df = fetch_all_company_rows(
+        ymd,
+        item,
+        company["market"],
+        company["code"],
+    )
+    if df.empty:
+        return df
+    df = df.copy()
+    if "법인" not in df.columns:
+        df.insert(1, "법인", company["name"])
+    return df
+
+
+def _peer_benchmark_for_group_v15(
+    stats_by_label: Dict[str, pd.DataFrame],
+    peer_labels: List[str],
+    unit_key: str,
+    grade_key: str,
+) -> Tuple[int | None, int]:
+    vals = []
+    for label in peer_labels:
+        sdf = stats_by_label.get(label)
+        if sdf is None or sdf.empty:
+            continue
+        rows = sdf[
+            (sdf["비교단위"] == unit_key) &
+            (sdf["비교등급"] == grade_key)
+        ]
+        if rows.empty:
+            continue
+        vals.append(int(rows.iloc[0]["중간"]))
+
+    if not vals:
+        return None, 0
+
+    # 법인별 중간가를 다시 실제 중앙순번 방식으로 대표값화
+    return actual_middle_price(vals), len(vals)
+
+
+def _diagnosis_label_v15(
+    market_change_pct: float,
+    our_gap_pct: float,
+    threshold_pct: float,
+) -> str:
+    market_weak = market_change_pct <= -threshold_pct
+    our_weak = our_gap_pct <= -threshold_pct
+
+    if market_weak and our_weak:
+        return "🔻 비교 시세도 약세 + 우리도 더 낮음"
+    if market_weak:
+        return "🔻 비교 법인 시세 자체가 약세"
+    if our_weak:
+        return "⚠️ 비교 법인은 버티는데 우리만 낮음"
+    return "➡️ 뚜렷한 약세 신호 없음"
+
+
+def build_weakness_diagnosis_v15(
+    companies_by_label: Dict[str, Dict[str, str]],
+    current_frames: List[pd.DataFrame],
+    selected_labels: List[str],
+    our_label: str,
+    search_date: str,
+    item: str,
+    lookback_markets: int,
+    threshold_pct: float,
+    max_calendar_scan: int = 21,
+) -> Tuple[pd.DataFrame, Dict[str, object]]:
+    frame_map = _selected_frame_map_v15(current_frames)
+    if our_label not in frame_map:
+        return pd.DataFrame(), {"message": "우리 법인의 오늘 자료가 없습니다."}
+
+    peer_labels = [x for x in selected_labels if x != our_label and x in companies_by_label]
+    if not peer_labels:
+        return pd.DataFrame(), {"message": "비교할 타 법인이 없습니다."}
+
+    # 오늘 법인별 그룹 통계
+    today_stats: Dict[str, pd.DataFrame] = {}
+    for label in selected_labels:
+        df = frame_map.get(label)
+        if df is not None and not df.empty:
+            today_stats[label] = _group_stats_v15(df, label)
+
+    our_stats = today_stats.get(our_label, pd.DataFrame())
+    if our_stats.empty:
+        return pd.DataFrame(), {"message": "우리 법인의 오늘 비교 가능한 가격이 없습니다."}
+
+    # 오늘 우리와 타 법인 모두 존재하는 그룹만 진단
+    target_groups = []
+    for _, r in our_stats.iterrows():
+        u = r["비교단위"]
+        gr = r["비교등급"]
+        peer_today, peer_count = _peer_benchmark_for_group_v15(
+            today_stats, peer_labels, u, gr
+        )
+        if peer_today is not None:
+            target_groups.append((u, gr))
+
+    if not target_groups:
+        return pd.DataFrame(), {
+            "message": "오늘 우리 법인과 타 법인에 공통인 단위·등급 그룹이 없습니다."
+        }
+
+    # 과거 일별 타 법인 대표 중간가 / 우리 중간가 저장
+    history_peer: Dict[Tuple[str, str], List[Tuple[str, int, int]]] = {
+        g: [] for g in target_groups
+    }
+    history_our: Dict[Tuple[str, str], List[Tuple[str, int]]] = {
+        g: [] for g in target_groups
+    }
+
+    base_date = datetime.strptime(search_date, "%Y%m%d").date()
+    scanned = 0
+
+    for offset in range(1, max_calendar_scan + 1):
+        # 모든 그룹이 필요한 장 수를 채웠으면 종료
+        if all(len(history_peer[g]) >= lookback_markets for g in target_groups):
+            break
+
+        d = base_date - timedelta(days=offset)
+        ymd = d.strftime("%Y%m%d")
+        scanned += 1
+
+        day_stats: Dict[str, pd.DataFrame] = {}
+
+        # 우리 + 비교 법인 모두 조회. fetch_all_company_rows 자체가 캐시됨.
+        for label in selected_labels:
+            company = companies_by_label.get(label)
+            if not company:
+                continue
+            try:
+                hdf = _fetch_company_frame_v15(company, ymd, item)
+            except Exception:
+                continue
+            if hdf.empty:
+                continue
+            day_stats[label] = _group_stats_v15(hdf, label)
+
+        if not day_stats:
+            continue
+
+        for group in target_groups:
+            u, gr = group
+
+            if len(history_peer[group]) < lookback_markets:
+                peer_value, peer_count = _peer_benchmark_for_group_v15(
+                    day_stats, peer_labels, u, gr
+                )
+                if peer_value is not None:
+                    history_peer[group].append((ymd, peer_value, peer_count))
+
+            if len(history_our[group]) < lookback_markets:
+                osdf = day_stats.get(our_label)
+                if osdf is not None and not osdf.empty:
+                    rr = osdf[
+                        (osdf["비교단위"] == u) &
+                        (osdf["비교등급"] == gr)
+                    ]
+                    if not rr.empty:
+                        history_our[group].append((ymd, int(rr.iloc[0]["중간"])))
+
+    rows = []
+
+    for u, gr in target_groups:
+        our_row = our_stats[
+            (our_stats["비교단위"] == u) &
+            (our_stats["비교등급"] == gr)
+        ]
+        if our_row.empty:
+            continue
+
+        our_today = int(our_row.iloc[0]["중간"])
+        peer_today, peer_count_today = _peer_benchmark_for_group_v15(
+            today_stats, peer_labels, u, gr
+        )
+        if peer_today is None or peer_today <= 0:
+            continue
+
+        ph = history_peer.get((u, gr), [])
+        if not ph:
+            rows.append({
+                "단위": u,
+                "등급": gr,
+                "우리오늘": our_today,
+                "타법인오늘": peer_today,
+                f"타법인최근{lookback_markets}장": None,
+                "시세변동%": None,
+                "우리격차%": round((our_today / peer_today - 1) * 100, 1),
+                "오늘비교법인수": peer_count_today,
+                "과거확보장수": 0,
+                "진단": "과거자료 부족",
+            })
+            continue
+
+        peer_hist_values = [x[1] for x in ph[:lookback_markets]]
+        peer_hist_avg = round(mean(peer_hist_values))
+        market_change = (
+            (peer_today / peer_hist_avg - 1) * 100
+            if peer_hist_avg > 0 else 0.0
+        )
+        our_gap = (our_today / peer_today - 1) * 100
+
+        label = _diagnosis_label_v15(
+            market_change,
+            our_gap,
+            threshold_pct,
+        )
+
+        rows.append({
+            "단위": u,
+            "등급": gr,
+            "우리오늘": our_today,
+            "타법인오늘": peer_today,
+            f"타법인최근{lookback_markets}장": peer_hist_avg,
+            "시세변동%": round(market_change, 1),
+            "우리격차%": round(our_gap, 1),
+            "오늘비교법인수": peer_count_today,
+            "과거확보장수": min(len(peer_hist_values), lookback_markets),
+            "진단": label,
+        })
+
+    meta = {
+        "scanned_calendar_days": scanned,
+        "peer_labels": peer_labels,
+        "lookback": lookback_markets,
+        "threshold": threshold_pct,
+    }
+    return pd.DataFrame(rows), meta
+
+
+def render_weakness_diagnosis_v15(
+    companies_by_label: Dict[str, Dict[str, str]],
+    current_frames: List[pd.DataFrame],
+    selected_labels: List[str],
+    search_date: str,
+    item: str,
+):
+    st.markdown("## 📉 시세 약세 / 우리만 약세 진단")
+    st.caption(
+        "선택한 법인들만 기준으로 봅니다. `시장 전체`를 단정하는 기능은 아닙니다. "
+        "오늘 타 법인 중간가와 최근 장들의 타 법인 일별 중간가를 비교합니다."
+    )
+
+    if len(selected_labels) < 2:
+        st.info("법인을 2곳 이상 선택하면 진단할 수 있습니다.")
+        return
+
+    c1, c2, c3 = st.columns([1.4, 1, 1])
+    with c1:
+        our_label = st.selectbox(
+            "우리 법인",
+            options=selected_labels,
+            index=0,
+            key=f"diag_our::{search_date}::{item}",
+        )
+    with c2:
+        lookback = st.selectbox(
+            "최근 기준",
+            options=[3, 5],
+            index=1,
+            format_func=lambda x: f"최근 {x}장",
+            key=f"diag_lookback::{search_date}::{item}",
+        )
+    with c3:
+        threshold = st.selectbox(
+            "약세 기준",
+            options=[3, 5, 7, 10],
+            index=1,
+            format_func=lambda x: f"{x}% 이상",
+            key=f"diag_threshold::{search_date}::{item}",
+        )
+
+    diag_state_key = (
+        f"diag_run::{search_date}::{item}::"
+        + "::".join(selected_labels)
+    )
+    if st.button(
+        "📉 약세 진단 실행",
+        type="primary",
+        use_container_width=True,
+        key=f"diag_button::{search_date}::{item}",
+    ):
+        st.session_state[diag_state_key] = True
+
+    if not st.session_state.get(diag_state_key, False):
+        st.caption(
+            "예: 타 법인 오늘 중간가가 최근 5장 평균보다 5% 이상 낮으면 "
+            "`비교 시세 약세`, 우리 중간가가 타 법인보다 5% 이상 낮으면 "
+            "`우리만 낮음` 신호로 봅니다."
+        )
+        return
+
+    with st.spinner(
+        f"최근 {lookback}장 비교자료 확인 중... "
+        "휴장일은 건너뛰므로 처음 한 번은 시간이 조금 걸릴 수 있습니다."
+    ):
+        diag_df, meta = build_weakness_diagnosis_v15(
+            companies_by_label,
+            current_frames,
+            selected_labels,
+            our_label,
+            search_date,
+            item,
+            lookback,
+            float(threshold),
+        )
+
+    if diag_df.empty:
+        st.warning(meta.get("message", "진단 가능한 공통 가격자료가 없습니다."))
+        return
+
+    hist_col = f"타법인최근{lookback}장"
+
+    def _style_diag_v15(row):
+        text = str(row.get("진단", ""))
+        if "우리만 낮음" in text:
+            return ["background-color: #fff0f0; font-weight: 700;"] * len(row)
+        if "시세도 약세" in text:
+            return ["background-color: #fff1e6; font-weight: 700;"] * len(row)
+        if "시세 자체가 약세" in text:
+            return ["background-color: #fff8df; font-weight: 700;"] * len(row)
+        return [""] * len(row)
+
+    show_cols = [
+        "단위", "등급", "우리오늘", "타법인오늘", hist_col,
+        "시세변동%", "우리격차%", "오늘비교법인수", "과거확보장수", "진단",
+    ]
+
+    st.dataframe(
+        diag_df[show_cols].style
+        .apply(_style_diag_v15, axis=1)
+        .format({
+            "우리오늘": "{:,.0f}",
+            "타법인오늘": "{:,.0f}",
+            hist_col: lambda x: "-" if pd.isna(x) else f"{x:,.0f}",
+            "시세변동%": lambda x: "-" if pd.isna(x) else f"{x:+.1f}%",
+            "우리격차%": lambda x: "-" if pd.isna(x) else f"{x:+.1f}%",
+            "오늘비교법인수": "{:,.0f}",
+            "과거확보장수": "{:,.0f}",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    peer_text = ", ".join(meta.get("peer_labels", []))
+    st.caption(
+        f"우리: {our_label} · 비교: {peer_text} · "
+        f"약세 기준 {threshold}% · 휴장일은 자동 건너뜀"
+    )
+
+    if any(diag_df["등급"].astype(str) == "세부규격 미확인"):
+        st.warning(
+            "⚠ `세부규격 미확인` 그룹은 42/45망, 4내/4수 등 실제 규격이 섞였을 수 있어 "
+            "진단도 참고용입니다."
+        )
+
 
 def build_excel_bytes(selected_frames: List[pd.DataFrame]) -> bytes:
     all_df = pd.concat(selected_frames, ignore_index=True)
@@ -2576,8 +3194,8 @@ if mode == "🔍 세부규격 찾기":
     st.stop()
 
 st.title("가락·강서 경매조회")
-st.caption("✅ APP VERSION: v14-COMPARE-FIX")
-st.caption("장일자 + 품목 → 법인 2곳 이상 선택 → 비교표를 선택 문구 바로 아래 표시")
+st.caption("✅ APP VERSION: v16-TODAY-ITEM-PICKER")
+st.caption("품목 입력 시 바로 법인검색 · 품목을 비우면 오늘 진행 품목 선택 후 법인검색")
 
 default_item = qp_get("item", "")
 default_date = parse_default_date(qp_get("date", ""))
@@ -2631,23 +3249,40 @@ with st.expander("🧩 세부규격 자동보강 설정", expanded=False):
     elif enrich_toggle:
         st.warning("자동보강 ON · API 키를 입력해야 실제 보강이 시작됩니다.")
 
-search_clicked = st.button("경매 법인 찾기", type="primary", use_container_width=True)
+search_clicked = st.button("경매 법인 찾기 / 오늘 품목 보기", type="primary", use_container_width=True)
 
 if search_clicked:
-    if not item_text:
-        st.error("품목을 입력해 주세요.")
-        st.stop()
     if not market_scope:
         st.error("가락 또는 강서를 하나 이상 선택해 주세요.")
         st.stop()
 
     ymd = selected_date.strftime("%Y%m%d")
-    st.session_state["search"] = {
-        "date": ymd,
-        "item": item_text,
-        "markets": tuple(market_scope),
-    }
-    qp_set(date=ymd, item=item_text, markets=",".join(market_scope))
+
+    if not item_text:
+        # v16: 품목 미입력 -> 당일 실제 진행 품목 선택 화면
+        st.session_state.pop("search", None)
+        st.session_state["item_picker_request_v16"] = {
+            "date": ymd,
+            "markets": tuple(market_scope),
+        }
+        qp_set(date=ymd, item="", markets=",".join(market_scope))
+    else:
+        st.session_state.pop("item_picker_request_v16", None)
+        st.session_state["search"] = {
+            "date": ymd,
+            "item": item_text,
+            "markets": tuple(market_scope),
+        }
+        qp_set(date=ymd, item=item_text, markets=",".join(market_scope))
+
+# 품목을 비워 검색한 경우: 오늘 진행 품목 선택 -> 선택 후 다시 법인 선택
+if "item_picker_request_v16" in st.session_state:
+    picker = st.session_state["item_picker_request_v16"]
+    render_today_item_picker_v16(
+        picker["date"],
+        tuple(picker["markets"]),
+    )
+    st.stop()
 
 # URL에 검색조건이 있으면 새로고침 후에도 같은 검색화면 복원
 if "search" not in st.session_state and default_item:
@@ -2658,7 +3293,7 @@ if "search" not in st.session_state and default_item:
     }
 
 if "search" not in st.session_state:
-    st.info("장일자와 품목을 입력한 뒤 **경매 법인 찾기**를 누르세요.")
+    st.info("품목을 입력해 바로 검색하거나, 품목을 비운 채 **경매 법인 찾기 / 오늘 품목 보기**를 누르세요.")
     st.stop()
 
 search = st.session_state["search"]
@@ -2803,11 +3438,11 @@ if not selected_labels:
 
 label_to_company = company_by_label
 
-# v14: 선택 문구 바로 아래에 비교표를 먼저 출력
+# v15: 선택 문구 바로 아래에 비교표 + 약세 진단
 if len(selected_labels) >= 2:
-    st.markdown("### 🔎 v14 비교표 준비")
+    st.markdown("### 🔎 v15 비교/진단 준비")
     compare_frames: List[pd.DataFrame] = []
-    with st.spinner("선택한 법인들의 경매자료를 비교 중..."):
+    with st.spinner("선택한 법인들의 오늘 경매자료를 비교 중..."):
         for label in selected_labels:
             c = label_to_company[label]
             df_cmp = fetch_all_company_rows(
@@ -2817,7 +3452,15 @@ if len(selected_labels) >= 2:
                 df_cmp = df_cmp.copy()
                 df_cmp.insert(1, "법인", c["name"])
                 compare_frames.append(df_cmp)
+
     render_compare_v14(compare_frames, selected_labels, search["item"])
+    render_weakness_diagnosis_v15(
+        label_to_company,
+        compare_frames,
+        selected_labels,
+        search["date"],
+        search["item"],
+    )
 
 st.divider()
 
