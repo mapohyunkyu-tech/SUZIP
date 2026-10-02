@@ -411,55 +411,43 @@ def _base_item_name_v16(raw_name: str) -> str:
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def discover_today_items_v16(
+def discover_today_items_v17(
     date_yyyymmdd: str,
     markets: Tuple[str, ...],
 ) -> List[Dict[str, object]]:
     """
-    품목을 비운 상태로 각 법인의 당일 경매결과를 조회해,
-    실제로 결과가 올라온 품목만 모은다.
+    v17 빠른 방식:
+    법인별로 전부 돌지 않고, 시장별 '법인 전체' 조회를 딱 한 번씩만 페이지 순회한다.
+    가락/강서를 둘 다 선택해도 최대 2개 시장 조회만 수행한다.
 
-    반환:
-      item       : 다시 검색할 품목명
-      raw_names  : 실제 공개 품목(품종) 표기
-      rows       : 확인된 거래행 수
-      companies  : 결과가 확인된 법인 수
-      markets    : 확인된 시장
+    품목 선택 후에만 해당 품목 기준으로 법인별 ✅/⏳ 상태를 다시 확인한다.
     """
-    candidates: List[Dict[str, str]] = []
-    for market_name in markets:
-        _, opts = get_market_context(market_name)
-        candidates.extend(opts)
-
-    # 품목별 집계
     agg: Dict[str, Dict[str, object]] = {}
 
-    def fetch_candidate(c: Dict[str, str]):
-        # 빈 품목으로 해당 법인의 오늘 결과 전체를 페이지 끝까지 조회
+    def fetch_market(market_name: str):
+        # s_bubin="" = 법인 전체
         df = fetch_all_company_rows(
             date_yyyymmdd,
             "",
-            c["market"],
-            c["code"],
+            market_name,
+            "",
             max_pages=100,
         )
-        return c, df
+        return market_name, df
 
-    workers = min(8, max(1, len(candidates)))
+    workers = min(2, max(1, len(markets)))
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        future_map = {ex.submit(fetch_candidate, c): c for c in candidates}
+        future_map = {ex.submit(fetch_market, m): m for m in markets}
 
         for fut in as_completed(future_map):
-            c = future_map[fut]
+            market_name = future_map[fut]
             try:
-                c2, df = fut.result()
+                market_name, df = fut.result()
             except Exception:
                 continue
 
             if df is None or df.empty:
                 continue
-
-            company_label = f'{c2["market"]} · {c2["name"]}'
 
             for raw_name, g in df.groupby("품목(품종)", sort=False):
                 item_name = _base_item_name_v16(raw_name)
@@ -472,14 +460,12 @@ def discover_today_items_v16(
                         "item": item_name,
                         "raw_names": set(),
                         "rows": 0,
-                        "company_labels": set(),
                         "market_names": set(),
                     },
                 )
                 slot["raw_names"].add(str(raw_name))
                 slot["rows"] += int(len(g))
-                slot["company_labels"].add(company_label)
-                slot["market_names"].add(c2["market"])
+                slot["market_names"].add(market_name)
 
     out: List[Dict[str, object]] = []
     for item_name, slot in agg.items():
@@ -488,15 +474,13 @@ def discover_today_items_v16(
                 "item": item_name,
                 "raw_names": sorted(slot["raw_names"]),
                 "rows": int(slot["rows"]),
-                "companies": len(slot["company_labels"]),
-                "company_labels": sorted(slot["company_labels"]),
                 "markets": sorted(slot["market_names"]),
             }
         )
 
-    # 거래행 많은 품목 우선, 같은 건수면 이름순
     out.sort(key=lambda x: (-int(x["rows"]), str(x["item"])))
     return out
+
 
 
 def render_today_item_picker_v16(
@@ -517,7 +501,7 @@ def render_today_item_picker_v16(
             use_container_width=True,
             key=f"today_items_reload::{date_yyyymmdd}::{','.join(markets)}",
         ):
-            discover_today_items_v16.clear()
+            discover_today_items_v17.clear()
             fetch_all_company_rows.clear()
             st.rerun()
     with info_col:
@@ -526,8 +510,8 @@ def render_today_item_picker_v16(
             + " + ".join(markets)
         )
 
-    with st.spinner("오늘 진행된 품목을 법인별 경매결과에서 모으는 중..."):
-        items = discover_today_items_v16(date_yyyymmdd, tuple(markets))
+    with st.spinner("오늘 진행된 품목을 시장 전체에서 빠르게 모으는 중..."):
+        items = discover_today_items_v17(date_yyyymmdd, tuple(markets))
 
     if not items:
         st.warning(
@@ -543,8 +527,7 @@ def render_today_item_picker_v16(
     for x in items:
         market_text = "/".join(x["markets"])
         label = (
-            f'{x["item"]}  ·  {x["rows"]:,}건  ·  '
-            f'{x["companies"]}법인  ·  {market_text}'
+            f'{x["item"]}  ·  {x["rows"]:,}건  ·  {market_text}'
         )
         option_labels.append(label)
         by_label[label] = x
@@ -560,7 +543,7 @@ def render_today_item_picker_v16(
     if selected_label:
         x = by_label[selected_label]
         with st.expander("이 품목이 확인된 법인/표기"):
-            st.write("법인:", " · ".join(x["company_labels"]))
+            st.write("시장:", " · ".join(x["markets"]))
             st.write("공개 품목표기:", " / ".join(x["raw_names"]))
 
         if st.button(
@@ -3176,13 +3159,281 @@ def parse_default_date(raw: str) -> date:
 
 
 # =========================================================
+# v18: 즐겨찾기 빠른조회
+# =========================================================
+DEFAULT_FAVORITES_V18 = ["표고", "상추"]
+
+
+def _clean_favorites_v18(values: List[str]) -> List[str]:
+    out = []
+    seen = set()
+    for raw in values:
+        text = re.sub(r"\s+", " ", str(raw or "")).strip()
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return out
+
+
+def load_favorites_v18() -> List[str]:
+    # URL query-param에 저장해서 모바일 재접속/새로고침 후에도 유지되게 함.
+    raw = qp_get("favs", "")
+    if raw.strip():
+        vals = [unquote(x).strip() for x in raw.split(",") if x.strip()]
+        vals = _clean_favorites_v18(vals)
+        if vals:
+            return vals
+
+    saved = st.session_state.get("favorites_v18")
+    if isinstance(saved, list) and saved:
+        return _clean_favorites_v18(saved)
+
+    return list(DEFAULT_FAVORITES_V18)
+
+
+def save_favorites_v18(values: List[str]):
+    vals = _clean_favorites_v18(values)
+    st.session_state["favorites_v18"] = vals
+    qp_set(favs=",".join(quote(x, safe="") for x in vals))
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def probe_market_item_v18(
+    date_yyyymmdd: str,
+    item: str,
+    market_name: str,
+) -> int:
+    """
+    즐겨찾기 품목이 오늘 해당 시장에 하나라도 있는지만 빠르게 확인.
+    법인을 일일이 돌지 않고 법인 전체(s_bubin='') 첫 페이지 1회만 확인.
+    """
+    market_code = MARKETS[market_name]
+    date_dot = f"{date_yyyymmdd[:4]}.{date_yyyymmdd[4:6]}.{date_yyyymmdd[6:8]}"
+    base_fields, _ = get_market_context(market_name)
+
+    with make_session() as s:
+        payload = make_payload(
+            base_fields,
+            market_code,
+            date_dot,
+            item,
+            "",
+            1,
+        )
+        r = s.post(result_url(market_code), data=payload, timeout=30)
+        r.raise_for_status()
+        rows = parse_auction_rows(r.text)
+    return len(rows)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def favorite_status_v18(
+    date_yyyymmdd: str,
+    favorites: Tuple[str, ...],
+    markets: Tuple[str, ...],
+) -> List[Dict[str, object]]:
+    """
+    즐겨찾기 N개 × 선택시장(최대 2개)만 동시에 빠르게 조회.
+    전체 품목 스캔은 하지 않는다.
+    """
+    results: Dict[str, Dict[str, object]] = {
+        item: {
+            "item": item,
+            "markets": [],
+            "rows": 0,
+            "available": False,
+        }
+        for item in favorites
+    }
+
+    jobs = [(item, market) for item in favorites for market in markets]
+    if not jobs:
+        return []
+
+    workers = min(12, max(1, len(jobs)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        future_map = {
+            ex.submit(probe_market_item_v18, date_yyyymmdd, item, market): (item, market)
+            for item, market in jobs
+        }
+
+        for fut in as_completed(future_map):
+            item, market = future_map[fut]
+            try:
+                count = int(fut.result())
+            except Exception:
+                count = 0
+
+            if count > 0:
+                results[item]["available"] = True
+                results[item]["markets"].append(market)
+                results[item]["rows"] += count
+
+    # 즐겨찾기 순서 유지
+    return [results[item] for item in favorites]
+
+
+def render_favorites_v18(
+    date_yyyymmdd: str,
+    markets: Tuple[str, ...],
+):
+    st.divider()
+    st.subheader("⭐ 즐겨찾기 빠른조회")
+    st.caption(
+        "전체 품목을 다 훑지 않고 즐겨찾기 품목만 동시에 확인합니다. "
+        "✅ 품목을 누르면 그 품목 기준으로 법인 선택 화면으로 바로 넘어갑니다."
+    )
+
+    favorites = load_favorites_v18()
+    st.session_state["favorites_v18"] = favorites
+
+    with st.expander("⭐ 즐겨찾기 관리", expanded=False):
+        add_col, remove_col = st.columns([1.4, 1])
+        with add_col:
+            new_item = st.text_input(
+                "품목 추가",
+                placeholder="예: 표고, 상추, 양배추",
+                key="fav_add_v18",
+            ).strip()
+            if st.button(
+                "➕ 즐겨찾기 추가",
+                use_container_width=True,
+                key="fav_add_btn_v18",
+            ):
+                if new_item:
+                    updated = _clean_favorites_v18(favorites + [new_item])
+                    save_favorites_v18(updated)
+                    favorite_status_v18.clear()
+                    st.rerun()
+
+        with remove_col:
+            remove_items = st.multiselect(
+                "삭제할 품목",
+                options=favorites,
+                key="fav_remove_v18",
+            )
+            if st.button(
+                "🗑 선택 삭제",
+                use_container_width=True,
+                disabled=not remove_items,
+                key="fav_remove_btn_v18",
+            ):
+                updated = [x for x in favorites if x not in set(remove_items)]
+                save_favorites_v18(updated)
+                favorite_status_v18.clear()
+                st.rerun()
+
+    if not favorites:
+        st.info("즐겨찾기 품목을 하나 이상 추가해 주세요.")
+        return
+
+    reload_col, date_col = st.columns([1, 2.4])
+    with reload_col:
+        if st.button(
+            "🔄 상태 새로고침",
+            use_container_width=True,
+            key=f"fav_reload::{date_yyyymmdd}::{','.join(markets)}",
+        ):
+            favorite_status_v18.clear()
+            probe_market_item_v18.clear()
+            st.rerun()
+    with date_col:
+        st.caption(
+            f"{date_yyyymmdd[:4]}-{date_yyyymmdd[4:6]}-{date_yyyymmdd[6:8]} · "
+            + " + ".join(markets)
+        )
+
+    with st.spinner("즐겨찾기 품목만 오늘 경매 여부 확인 중..."):
+        statuses = favorite_status_v18(
+            date_yyyymmdd,
+            tuple(favorites),
+            tuple(markets),
+        )
+
+    cols = st.columns(2)
+    any_available = False
+
+    for idx, row in enumerate(statuses):
+        item = str(row["item"])
+        available = bool(row["available"])
+        item_markets = list(row["markets"])
+        any_available = any_available or available
+
+        if available:
+            market_text = "/".join(item_markets)
+            label = f"✅ {item} · {market_text}"
+            help_text = "오늘 경매결과 있음 · 눌러서 법인 선택으로 이동"
+        else:
+            label = f"⏳ {item}"
+            help_text = "현재 선택 시장에서 오늘 경매결과 미확인"
+
+        with cols[idx % 2]:
+            clicked = st.button(
+                label,
+                disabled=not available,
+                type="primary" if available else "secondary",
+                use_container_width=True,
+                help=help_text,
+                key=f"fav_item::{date_yyyymmdd}::{item}",
+            )
+
+        if clicked and available:
+            st.session_state["search"] = {
+                "date": date_yyyymmdd,
+                "item": item,
+                "markets": tuple(markets),
+            }
+            st.session_state.pop("favorites_request_v18", None)
+            st.session_state.pop("item_picker_request_v16", None)
+
+            # 품목이 바뀌었으므로 법인 선택은 새로 시작
+            for k in list(st.session_state.keys()):
+                if str(k).startswith("corp_selected::"):
+                    st.session_state.pop(k, None)
+
+            qp_set(
+                date=date_yyyymmdd,
+                item=item,
+                markets=",".join(markets),
+            )
+            st.rerun()
+
+    if not any_available:
+        st.info("현재 즐겨찾기 중 오늘 경매결과가 확인된 품목이 없습니다.")
+
+    st.divider()
+    with st.expander("전체 품목에서 찾기 (느림)", expanded=False):
+        st.caption(
+            "즐겨찾기에 없는 품목이 필요할 때만 사용하세요. "
+            "시장 전체 품목을 훑기 때문에 즐겨찾기 조회보다 오래 걸립니다."
+        )
+        if st.button(
+            "📋 전체 품목 보기",
+            use_container_width=True,
+            key=f"all_items_slow::{date_yyyymmdd}::{','.join(markets)}",
+        ):
+            st.session_state["item_picker_request_v16"] = {
+                "date": date_yyyymmdd,
+                "markets": tuple(markets),
+            }
+            st.session_state.pop("favorites_request_v18", None)
+            st.rerun()
+
+
+# =========================================================
 # UI
 # =========================================================
-mode = st.radio(
-    "기능",
-    ["📊 경매조회", "🧩 등외 해체", "🔍 세부규격 찾기"],
-    horizontal=True,
-    label_visibility="collapsed",
+mode_options = ["📊 경매조회", "🧩 등외 해체", "🔍 세부규격 찾기"]
+mode = st.selectbox(
+    "메뉴",
+    mode_options,
+    index=0,
+    key="top_mode_v18",
+    help="모바일에서 메뉴가 가려지지 않도록 드롭다운 방식으로 바꿨습니다.",
 )
 
 if mode == "🧩 등외 해체":
@@ -3194,8 +3445,8 @@ if mode == "🔍 세부규격 찾기":
     st.stop()
 
 st.title("가락·강서 경매조회")
-st.caption("✅ APP VERSION: v16-TODAY-ITEM-PICKER")
-st.caption("품목 입력 시 바로 법인검색 · 품목을 비우면 오늘 진행 품목 선택 후 법인검색")
+st.caption("✅ APP VERSION: v18-FAVORITES-MOBILE-MENU")
+st.caption("품목 입력 시 바로 검색 · 품목 미입력 시 ⭐ 즐겨찾기만 빠르게 확인")
 
 default_item = qp_get("item", "")
 default_date = parse_default_date(qp_get("date", ""))
@@ -3249,7 +3500,7 @@ with st.expander("🧩 세부규격 자동보강 설정", expanded=False):
     elif enrich_toggle:
         st.warning("자동보강 ON · API 키를 입력해야 실제 보강이 시작됩니다.")
 
-search_clicked = st.button("경매 법인 찾기 / 오늘 품목 보기", type="primary", use_container_width=True)
+search_clicked = st.button("경매 법인 찾기 / ⭐ 즐겨찾기", type="primary", use_container_width=True)
 
 if search_clicked:
     if not market_scope:
@@ -3259,14 +3510,16 @@ if search_clicked:
     ymd = selected_date.strftime("%Y%m%d")
 
     if not item_text:
-        # v16: 품목 미입력 -> 당일 실제 진행 품목 선택 화면
+        # v18: 품목 미입력 -> 즐겨찾기만 빠르게 확인
         st.session_state.pop("search", None)
-        st.session_state["item_picker_request_v16"] = {
+        st.session_state.pop("item_picker_request_v16", None)
+        st.session_state["favorites_request_v18"] = {
             "date": ymd,
             "markets": tuple(market_scope),
         }
         qp_set(date=ymd, item="", markets=",".join(market_scope))
     else:
+        st.session_state.pop("favorites_request_v18", None)
         st.session_state.pop("item_picker_request_v16", None)
         st.session_state["search"] = {
             "date": ymd,
@@ -3275,7 +3528,19 @@ if search_clicked:
         }
         qp_set(date=ymd, item=item_text, markets=",".join(market_scope))
 
-# 품목을 비워 검색한 경우: 오늘 진행 품목 선택 -> 선택 후 다시 법인 선택
+# 품목을 비워 검색한 경우: 즐겨찾기 품목만 오늘 경매 여부 확인
+if "favorites_request_v18" in st.session_state:
+    fav_req = st.session_state["favorites_request_v18"]
+    render_favorites_v18(
+        fav_req["date"],
+        tuple(fav_req["markets"]),
+    )
+
+    # 전체 품목 느린 보조모드로 전환된 경우에만 이어서 해당 화면 표시
+    if "item_picker_request_v16" not in st.session_state:
+        st.stop()
+
+# 보조기능: 전체 품목 검색
 if "item_picker_request_v16" in st.session_state:
     picker = st.session_state["item_picker_request_v16"]
     render_today_item_picker_v16(
@@ -3293,7 +3558,7 @@ if "search" not in st.session_state and default_item:
     }
 
 if "search" not in st.session_state:
-    st.info("품목을 입력해 바로 검색하거나, 품목을 비운 채 **경매 법인 찾기 / 오늘 품목 보기**를 누르세요.")
+    st.info("품목을 입력해 바로 검색하거나, 품목을 비운 채 **경매 법인 찾기 / ⭐ 즐겨찾기**를 누르세요.")
     st.stop()
 
 search = st.session_state["search"]
