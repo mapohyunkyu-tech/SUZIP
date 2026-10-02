@@ -3424,6 +3424,236 @@ def render_favorites_v18(
             st.rerun()
 
 
+
+# =========================================================
+# v19: 안정형 즐겨찾기
+# - 추가/삭제와 네트워크 조회를 분리
+# - 즐겨찾기 추가 직후 자동 로딩하지 않음
+# - '오늘 경매여부 확인'을 눌렀을 때만 조회
+# =========================================================
+def _fav_status_state_key_v19(
+    date_yyyymmdd: str,
+    markets: Tuple[str, ...],
+) -> str:
+    return f'fav_status_v19::{date_yyyymmdd}::{"|".join(markets)}'
+
+
+def _fav_signature_v19(favorites: List[str]) -> str:
+    return "|".join(_clean_favorites_v18(favorites))
+
+
+def render_favorites_v19(
+    date_yyyymmdd: str,
+    markets: Tuple[str, ...],
+):
+    st.divider()
+    st.subheader("⭐ 즐겨찾기 빠른조회")
+    st.caption(
+        "즐겨찾기 추가/삭제만 할 때는 조회하지 않습니다. "
+        "아래 `⚡ 오늘 경매여부 확인`을 눌렀을 때만 즐겨찾기 품목을 확인합니다."
+    )
+
+    favorites = load_favorites_v18()
+    st.session_state["favorites_v18"] = favorites
+
+    # 관리 영역: 네트워크 조회 없이 저장만
+    with st.expander("⭐ 즐겨찾기 관리", expanded=False):
+        new_item = st.text_input(
+            "품목 추가",
+            placeholder="예: 표고, 상추, 양배추",
+            key="fav_add_v19",
+        ).strip()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button(
+                "➕ 추가",
+                use_container_width=True,
+                key="fav_add_btn_v19",
+            ):
+                if new_item:
+                    updated = _clean_favorites_v18(favorites + [new_item])
+                    save_favorites_v18(updated)
+
+                    # 기존 상태는 품목 구성이 달라졌으므로 폐기.
+                    status_key = _fav_status_state_key_v19(date_yyyymmdd, markets)
+                    st.session_state.pop(status_key, None)
+                    st.success(f"즐겨찾기에 `{new_item}` 추가")
+                    st.rerun()
+
+        with c2:
+            if st.button(
+                "전체 초기화",
+                use_container_width=True,
+                key="fav_reset_btn_v19",
+            ):
+                save_favorites_v18(list(DEFAULT_FAVORITES_V18))
+                status_key = _fav_status_state_key_v19(date_yyyymmdd, markets)
+                st.session_state.pop(status_key, None)
+                st.rerun()
+
+        remove_items = st.multiselect(
+            "삭제할 품목",
+            options=favorites,
+            key="fav_remove_v19",
+        )
+        if st.button(
+            "🗑 선택 삭제",
+            use_container_width=True,
+            disabled=not remove_items,
+            key="fav_remove_btn_v19",
+        ):
+            updated = [x for x in favorites if x not in set(remove_items)]
+            save_favorites_v18(updated)
+            status_key = _fav_status_state_key_v19(date_yyyymmdd, markets)
+            st.session_state.pop(status_key, None)
+            st.rerun()
+
+    if not favorites:
+        st.info("즐겨찾기 품목을 하나 이상 추가해 주세요.")
+        return
+
+    status_key = _fav_status_state_key_v19(date_yyyymmdd, markets)
+    fav_signature = _fav_signature_v19(favorites)
+
+    check_col, meta_col = st.columns([1.25, 2.2])
+    with check_col:
+        run_check = st.button(
+            "⚡ 오늘 경매여부 확인",
+            type="primary",
+            use_container_width=True,
+            key=f"fav_check_v19::{date_yyyymmdd}::{','.join(markets)}",
+        )
+    with meta_col:
+        st.caption(
+            f"{date_yyyymmdd[:4]}-{date_yyyymmdd[4:6]}-{date_yyyymmdd[6:8]} · "
+            + " + ".join(markets)
+            + f" · 즐겨찾기 {len(favorites)}개"
+        )
+
+    if run_check:
+        try:
+            with st.spinner("즐겨찾기 품목만 확인 중..."):
+                statuses = favorite_status_v18(
+                    date_yyyymmdd,
+                    tuple(favorites),
+                    tuple(markets),
+                )
+            st.session_state[status_key] = {
+                "signature": fav_signature,
+                "statuses": statuses,
+            }
+        except Exception as e:
+            st.error("즐겨찾기 조회 중 오류가 발생했습니다.")
+            st.code(str(e))
+            st.session_state.pop(status_key, None)
+            return
+
+    cached = st.session_state.get(status_key)
+
+    # 즐겨찾기 목록이 바뀌면 이전 조회결과 사용 금지.
+    if not isinstance(cached, dict) or cached.get("signature") != fav_signature:
+        st.info("즐겨찾기를 추가한 뒤에는 위 **오늘 경매여부 확인**을 한 번 눌러 주세요.")
+        st.markdown("**현재 즐겨찾기:** " + " · ".join(favorites))
+
+        with st.expander("전체 품목에서 찾기 (느림)", expanded=False):
+            st.caption("즐겨찾기에 없는 품목을 찾을 때만 사용하세요.")
+            if st.button(
+                "📋 전체 품목 보기",
+                use_container_width=True,
+                key=f"all_items_v19::{date_yyyymmdd}::{','.join(markets)}",
+            ):
+                st.session_state["item_picker_request_v16"] = {
+                    "date": date_yyyymmdd,
+                    "markets": tuple(markets),
+                }
+                st.session_state.pop("favorites_request_v19", None)
+                st.rerun()
+        return
+
+    statuses = cached.get("statuses") or []
+    cols = st.columns(2)
+    any_available = False
+
+    for idx, row in enumerate(statuses):
+        item = str(row.get("item", ""))
+        available = bool(row.get("available", False))
+        item_markets = list(row.get("markets", []))
+        any_available = any_available or available
+
+        if available:
+            market_text = "/".join(item_markets)
+            label = f"✅ {item} · {market_text}"
+            help_text = "오늘 결과 있음 · 눌러서 이 품목의 법인 선택으로 이동"
+        else:
+            label = f"⏳ {item}"
+            help_text = "현재 선택 시장에서 오늘 결과 미확인"
+
+        with cols[idx % 2]:
+            clicked = st.button(
+                label,
+                disabled=not available,
+                type="primary" if available else "secondary",
+                use_container_width=True,
+                help=help_text,
+                key=f"fav_pick_v19::{date_yyyymmdd}::{item}",
+            )
+
+        if clicked and available:
+            # 새 품목으로 완전히 전환.
+            st.session_state["search"] = {
+                "date": date_yyyymmdd,
+                "item": item,
+                "markets": tuple(markets),
+            }
+            st.session_state.pop("favorites_request_v19", None)
+            st.session_state.pop("favorites_request_v18", None)
+            st.session_state.pop("item_picker_request_v16", None)
+
+            for k in list(st.session_state.keys()):
+                if str(k).startswith("corp_selected::"):
+                    st.session_state.pop(k, None)
+
+            qp_set(
+                date=date_yyyymmdd,
+                item=item,
+                markets=",".join(markets),
+            )
+            st.rerun()
+
+    if not any_available:
+        st.info("현재 즐겨찾기 중 오늘 경매결과가 확인된 품목이 없습니다.")
+
+    with st.expander("전체 품목에서 찾기 (느림)", expanded=False):
+        st.caption("즐겨찾기에 없는 품목을 찾을 때만 사용하세요.")
+        if st.button(
+            "📋 전체 품목 보기",
+            use_container_width=True,
+            key=f"all_items_v19b::{date_yyyymmdd}::{','.join(markets)}",
+        ):
+            st.session_state["item_picker_request_v16"] = {
+                "date": date_yyyymmdd,
+                "markets": tuple(markets),
+            }
+            st.session_state.pop("favorites_request_v19", None)
+            st.rerun()
+
+
+def safe_render_company_v19(
+    company: Dict[str, str],
+    date_yyyymmdd: str,
+    item: str,
+) -> pd.DataFrame:
+    try:
+        return render_company(company, date_yyyymmdd, item)
+    except Exception as e:
+        st.error(
+            f'{company["market"]} · {company["name"]} 상세 표시 중 오류가 발생했습니다.'
+        )
+        st.code(str(e))
+        return pd.DataFrame()
+
+
 # =========================================================
 # UI
 # =========================================================
@@ -3445,8 +3675,8 @@ if mode == "🔍 세부규격 찾기":
     st.stop()
 
 st.title("가락·강서 경매조회")
-st.caption("✅ APP VERSION: v18-FAVORITES-MOBILE-MENU")
-st.caption("품목 입력 시 바로 검색 · 품목 미입력 시 ⭐ 즐겨찾기만 빠르게 확인")
+st.caption("✅ APP VERSION: v19-FAVORITES-STABLE")
+st.caption("즐겨찾기 추가는 즉시 저장만 · `오늘 경매여부 확인`을 눌렀을 때만 조회")
 
 default_item = qp_get("item", "")
 default_date = parse_default_date(qp_get("date", ""))
@@ -3510,15 +3740,17 @@ if search_clicked:
     ymd = selected_date.strftime("%Y%m%d")
 
     if not item_text:
-        # v18: 품목 미입력 -> 즐겨찾기만 빠르게 확인
+        # v19: 품목 미입력 -> 안정형 즐겨찾기 화면
         st.session_state.pop("search", None)
         st.session_state.pop("item_picker_request_v16", None)
-        st.session_state["favorites_request_v18"] = {
+        st.session_state.pop("favorites_request_v18", None)
+        st.session_state["favorites_request_v19"] = {
             "date": ymd,
             "markets": tuple(market_scope),
         }
         qp_set(date=ymd, item="", markets=",".join(market_scope))
     else:
+        st.session_state.pop("favorites_request_v19", None)
         st.session_state.pop("favorites_request_v18", None)
         st.session_state.pop("item_picker_request_v16", None)
         st.session_state["search"] = {
@@ -3528,15 +3760,14 @@ if search_clicked:
         }
         qp_set(date=ymd, item=item_text, markets=",".join(market_scope))
 
-# 품목을 비워 검색한 경우: 즐겨찾기 품목만 오늘 경매 여부 확인
-if "favorites_request_v18" in st.session_state:
-    fav_req = st.session_state["favorites_request_v18"]
-    render_favorites_v18(
+# 품목을 비워 검색한 경우: 즐겨찾기 추가와 조회를 분리
+if "favorites_request_v19" in st.session_state:
+    fav_req = st.session_state["favorites_request_v19"]
+    render_favorites_v19(
         fav_req["date"],
         tuple(fav_req["markets"]),
     )
 
-    # 전체 품목 느린 보조모드로 전환된 경우에만 이어서 해당 화면 표시
     if "item_picker_request_v16" not in st.session_state:
         st.stop()
 
@@ -3718,14 +3949,23 @@ if len(selected_labels) >= 2:
                 df_cmp.insert(1, "법인", c["name"])
                 compare_frames.append(df_cmp)
 
-    render_compare_v14(compare_frames, selected_labels, search["item"])
-    render_weakness_diagnosis_v15(
-        label_to_company,
-        compare_frames,
-        selected_labels,
-        search["date"],
-        search["item"],
-    )
+    try:
+        render_compare_v14(compare_frames, selected_labels, search["item"])
+    except Exception as e:
+        st.error("법인 비교표 표시 중 오류가 발생했습니다.")
+        st.code(str(e))
+
+    try:
+        render_weakness_diagnosis_v15(
+            label_to_company,
+            compare_frames,
+            selected_labels,
+            search["date"],
+            search["item"],
+        )
+    except Exception as e:
+        st.error("약세 진단 표시 중 오류가 발생했습니다.")
+        st.code(str(e))
 
 st.divider()
 
@@ -3733,7 +3973,7 @@ selected_frames: List[pd.DataFrame] = []
 
 if len(selected_labels) == 1:
     company = label_to_company[selected_labels[0]]
-    frame = render_company(company, search["date"], search["item"])
+    frame = safe_render_company_v19(company, search["date"], search["item"])
     if not frame.empty:
         selected_frames.append(frame)
 else:
@@ -3741,7 +3981,7 @@ else:
     for tab, label in zip(tabs, selected_labels):
         with tab:
             company = label_to_company[label]
-            frame = render_company(company, search["date"], search["item"])
+            frame = safe_render_company_v19(company, search["date"], search["item"])
             if not frame.empty:
                 selected_frames.append(frame)
 
