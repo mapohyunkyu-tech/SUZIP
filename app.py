@@ -5505,6 +5505,150 @@ def garak_head_quality_reference_v31(
     }
 
 
+
+@st.cache_data(ttl=60, show_spinner=False)
+def build_garak_official_grade_heads_v32(
+    date_yyyymmdd: str,
+    item: str,
+    variety: str = "",
+    unit: str = "",
+) -> Dict[str, object]:
+    """
+    가락의 공식 등급(특/상/중)별 머리를 '엄격하게' 계산한다.
+    등급 자료가 없으면 다른 등급이나 전체 자료로 절대 대체하지 않는다.
+    """
+    item = _v24_text(item)
+    variety = _v24_text(variety)
+    unit = _v24_text(unit)
+
+    if not item or not unit:
+        return {"ok": False, "message": "품목과 단위/포장이 필요합니다.", "heads": {}}
+
+    try:
+        _, candidates = get_market_context("가락")
+    except Exception as e:
+        return {"ok": False, "message": f"가락 법인 목록 오류: {e}", "heads": {}}
+
+    if not candidates:
+        return {"ok": False, "message": "가락 법인 목록이 없습니다.", "heads": {}}
+
+    frames: Dict[str, pd.DataFrame] = {}
+    workers = min(10, max(1, len(candidates)))
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        fmap = {
+            ex.submit(
+                fetch_all_company_rows,
+                date_yyyymmdd,
+                item,
+                c["market"],
+                c["code"],
+            ): c
+            for c in candidates
+        }
+        for fut in as_completed(fmap):
+            c = fmap[fut]
+            try:
+                df = fut.result()
+            except Exception:
+                df = pd.DataFrame()
+            if df is not None and not df.empty:
+                frames[c["name"]] = df
+
+    if not frames:
+        return {"ok": False, "message": "가락 경매자료가 없습니다.", "heads": {}}
+
+    result_heads = {}
+
+    for target_grade in ("특", "상", "중"):
+        attempts = []
+        if variety:
+            attempts.append(("같은 품종·단위·공식등급", variety))
+        attempts.append(("같은 단위·공식등급", ""))
+
+        grade_result = None
+
+        for desc, use_variety in attempts:
+            all_prices = []
+            company_rows = []
+
+            for corp_name, df in frames.items():
+                f = _quality_filter_v24(
+                    df,
+                    "",
+                    use_variety,
+                    unit,
+                    target_grade,
+                )
+                if f.empty:
+                    continue
+
+                prices = []
+                for x in f["경락가"].tolist():
+                    try:
+                        if pd.notna(x) and float(x) > 0:
+                            prices.append(int(round(float(x))))
+                    except Exception:
+                        pass
+
+                if not prices:
+                    continue
+
+                all_prices.extend(prices)
+                company_rows.append({
+                    "법인": corp_name,
+                    "건수": len(prices),
+                    "머리": max(prices),
+                    "중간": actual_middle_price(prices),
+                    "꼬리": min(prices),
+                    "평균": round(mean(prices)),
+                })
+
+            if all_prices:
+                head = max(all_prices)
+                head_company = ""
+                for row in company_rows:
+                    if int(row["머리"]) == head:
+                        head_company = str(row["법인"])
+                        break
+
+                grade_result = {
+                    "ok": True,
+                    "grade": target_grade,
+                    "head": head,
+                    "description": desc,
+                    "company_count": len(company_rows),
+                    "row_count": len(all_prices),
+                    "head_company": head_company,
+                    "companies": sorted(
+                        company_rows,
+                        key=lambda x: int(x["머리"]),
+                        reverse=True,
+                    ),
+                }
+                break
+
+        if grade_result is None:
+            grade_result = {
+                "ok": False,
+                "grade": target_grade,
+                "message": f"{target_grade} 등급 동일단위 자료 없음",
+            }
+
+        result_heads[target_grade] = grade_result
+
+    return {"ok": True, "heads": result_heads}
+
+
+def _grade_head_ratio_v32(actual_price: int, grade_result: Dict[str, object]):
+    if not actual_price or not isinstance(grade_result, dict) or not grade_result.get("ok"):
+        return None
+    head = int(grade_result.get("head") or 0)
+    if head <= 0:
+        return None
+    return float(actual_price) / head * 100.0
+
+
 def quality_label_v31(main_grade: str, sub_grade: int) -> str:
     main_grade = str(main_grade or "").strip()
     if main_grade == "미판정":
@@ -5570,9 +5714,10 @@ def render_quality_encyclopedia_v24():
                 help="가락 머리는 같은 단위/포장끼리만 비교합니다.",
             ).strip()
             q_grade = st.text_input(
-                "공식 등급표기 (선택)",
+                "공식 등급표기 (참고·선택)",
                 placeholder="예: 특, 상",
                 key="q24_grade",
+                help="저장용 참고정보입니다. 가락 전체 머리 계산 기준에는 사용하지 않습니다.",
             ).strip()
 
         q_origin_country = st.selectbox(
@@ -5695,47 +5840,92 @@ def render_quality_encyclopedia_v24():
         )
 
         benchmark_key = (
-            f'q31_garak_head::{q_date.strftime("%Y%m%d")}::{q_item}::'
-            f'{q_variety}::{q_unit}::{q_grade}'
+            f'q32_garak_all_head::{q_date.strftime("%Y%m%d")}::{q_item}::'
+            f'{q_variety}::{q_unit}'
+        )
+        grade_heads_key = (
+            f'q32_garak_grade_heads::{q_date.strftime("%Y%m%d")}::{q_item}::'
+            f'{q_variety}::{q_unit}'
         )
 
         if st.button(
             "📊 가락 동일단위 머리 자동 계산",
             type="primary",
             use_container_width=True,
-            key="q31_calc_garak_head",
+            key="q32_calc_garak_head",
         ):
             if not q_item:
                 st.error("품목을 입력해 주세요.")
             elif not q_unit:
                 st.error("단위/포장을 입력해 주세요. 다른 중량 가격은 섞지 않습니다.")
             else:
-                with st.spinner("가락 법인별 동일 단위 경락가를 확인 중..."):
-                    result = build_garak_head_v31(
+                with st.spinner("가락 전체 머리와 특·상·중 머리를 확인 중..."):
+                    # 중요: 전체 머리는 q_grade를 넣지 않는다.
+                    # 따라서 저장되는 기본 비율은 언제나 '가락 동일단위 전체 머리 대비'다.
+                    overall_result = build_garak_head_v31(
                         q_date.strftime("%Y%m%d"),
                         q_item,
                         q_variety,
                         q_unit,
-                        q_grade,
+                        "",
                     )
-                st.session_state[benchmark_key] = result
+                    grade_heads_result = build_garak_official_grade_heads_v32(
+                        q_date.strftime("%Y%m%d"),
+                        q_item,
+                        q_variety,
+                        q_unit,
+                    )
+
+                if overall_result.get("ok"):
+                    overall_result = dict(overall_result)
+                    overall_result["description"] = (
+                        "가락 전체 동일단위 머리 · "
+                        + str(overall_result.get("description") or "").replace("가락 머리 · ", "")
+                    )
+                    overall_result["benchmark_grade_basis"] = "전체등급"
+
+                st.session_state[benchmark_key] = overall_result
+                st.session_state[grade_heads_key] = grade_heads_result
 
         benchmark_result = st.session_state.get(benchmark_key)
+        grade_heads_result = st.session_state.get(grade_heads_key)
         current_ref = {"ok": False, "count": 0}
 
         if isinstance(benchmark_result, dict):
             if benchmark_result.get("ok"):
                 benchmark = int(benchmark_result["benchmark"])
                 st.success(
-                    f'가락 머리 **{benchmark:,}원** · '
-                    f'{benchmark_result["company_count"]}법인 · '
-                    f'{benchmark_result["description"]}'
+                    f'가락 **전체등급 동일단위 머리 {benchmark:,}원** · '
+                    f'{benchmark_result["company_count"]}법인'
                 )
+                st.caption(
+                    "※ 아래 품위 기록의 기본 '가락 머리 대비 %'는 "
+                    "**특도 상도 아닌, 같은 단위 전체 거래의 최고가 대비**입니다."
+                )
+
                 if benchmark_result.get("head_company"):
                     st.caption(
-                        f'머리 법인: {benchmark_result["head_company"]} · '
+                        f'전체 머리 법인: {benchmark_result["head_company"]} · '
                         f'동일조건 거래행 {int(benchmark_result.get("row_count") or 0):,}건'
                     )
+
+                if isinstance(grade_heads_result, dict) and grade_heads_result.get("ok"):
+                    heads = grade_heads_result.get("heads") or {}
+                    cols = st.columns(3)
+                    for col, g in zip(cols, ("특", "상", "중")):
+                        gr = heads.get(g) or {}
+                        with col:
+                            if gr.get("ok"):
+                                st.metric(
+                                    f"가락 {g} 머리",
+                                    f'{int(gr.get("head") or 0):,}원',
+                                )
+                                st.caption(
+                                    f'{gr.get("description") or ""} · '
+                                    f'{int(gr.get("row_count") or 0)}건'
+                                )
+                            else:
+                                st.metric(f"가락 {g} 머리", "자료없음")
 
                 current_ref = garak_head_quality_reference_v31(
                     benchmark,
@@ -5750,17 +5940,17 @@ def render_quality_encyclopedia_v24():
                     if current_ref.get("ok"):
                         st.info(
                             f'과거 **{q_quality}** 실제낙찰 {current_ref["count"]}건 기준 · '
-                            f'가락 머리 대비 중앙 **{current_ref["median_ratio"]:.1f}%** · '
+                            f'가락 전체 동일단위 머리 대비 중앙 **{current_ref["median_ratio"]:.1f}%** · '
                             f'오늘 환산 **{current_ref["low"]:,} ~ {current_ref["high"]:,}원**'
                         )
                     else:
                         st.caption(
                             f'같은 품목·단위의 **{q_quality}** 완성 기록 '
                             f'{current_ref.get("count", 0)}건. '
-                            '3건 이상 쌓이면 가락 머리 대비 비율을 자동으로 보여줍니다.'
+                            '3건 이상 쌓이면 가락 전체 머리 대비 비율을 자동으로 보여줍니다.'
                         )
 
-                with st.expander("가락 법인별 동일조건 머리"):
+                with st.expander("가락 법인별 전체 동일단위 머리"):
                     bdf = pd.DataFrame(benchmark_result["companies"])
                     st.dataframe(
                         bdf.style.format({
@@ -5773,6 +5963,29 @@ def render_quality_encyclopedia_v24():
                         use_container_width=True,
                         hide_index=True,
                     )
+
+                if isinstance(grade_heads_result, dict) and grade_heads_result.get("ok"):
+                    heads = grade_heads_result.get("heads") or {}
+                    with st.expander("가락 공식등급별 법인 상세"):
+                        for g in ("특", "상", "중"):
+                            gr = heads.get(g) or {}
+                            if not gr.get("ok"):
+                                st.caption(f"{g}: 동일단위 자료 없음")
+                                continue
+                            st.markdown(f"**{g} 머리 {int(gr['head']):,}원**")
+                            gdf = pd.DataFrame(gr.get("companies") or [])
+                            if not gdf.empty:
+                                st.dataframe(
+                                    gdf.style.format({
+                                        "건수": "{:,.0f}",
+                                        "머리": "{:,.0f}",
+                                        "중간": "{:,.0f}",
+                                        "꼬리": "{:,.0f}",
+                                        "평균": "{:,.0f}",
+                                    }),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
             else:
                 st.warning(benchmark_result.get("message", "가락 머리 계산 실패"))
 
@@ -5793,7 +6006,35 @@ def render_quality_encyclopedia_v24():
         ):
             head_now = int(benchmark_result["benchmark"])
             ratio_now = float(actual_price) / head_now * 100.0
-            st.metric("가락 머리 대비", f"{ratio_now:.1f}%")
+
+            st.metric(
+                "가락 전체 동일단위 머리 대비",
+                f"{ratio_now:.1f}%",
+                help="특/상 중 하나가 아니라 같은 단위 전체 거래의 최고가 대비입니다.",
+            )
+
+            if isinstance(grade_heads_result, dict) and grade_heads_result.get("ok"):
+                heads = grade_heads_result.get("heads") or {}
+                ratio_cols = st.columns(3)
+                for col, g in zip(ratio_cols, ("특", "상", "중")):
+                    gr = heads.get(g) or {}
+                    rr = _grade_head_ratio_v32(int(actual_price), gr)
+                    with col:
+                        if rr is None:
+                            st.metric(f"{g} 머리 대비", "자료없음")
+                        else:
+                            st.metric(
+                                f"가락 {g} 머리 대비",
+                                f"{rr:.1f}%",
+                            )
+
+                selected_grade_result = (heads.get(q_quality_main) or {}) if q_quality_main in ("특", "상", "중") else {}
+                selected_ratio = _grade_head_ratio_v32(int(actual_price), selected_grade_result)
+                if selected_ratio is not None and q_quality != "미판정":
+                    st.info(
+                        f'선택 품위 **{q_quality}** → '
+                        f'가락 **{q_quality_main} 머리 대비 {selected_ratio:.1f}%**'
+                    )
 
         memo = st.text_area(
             "품위 메모",
@@ -5838,6 +6079,17 @@ def render_quality_encyclopedia_v24():
                 if q_origin_country and q_origin_country != "미확인":
                     memo_parts.append(f"[원산지·사용자입력] {q_origin_country}")
                 memo_parts.append(f"[품위] {q_quality}")
+                memo_parts.append("[기준] 가락 같은 단위 전체등급 머리 대비")
+
+                if actual_price and isinstance(grade_heads_result, dict) and grade_heads_result.get("ok"):
+                    heads_for_memo = grade_heads_result.get("heads") or {}
+                    ratio_bits = []
+                    for g in ("특", "상", "중"):
+                        rr = _grade_head_ratio_v32(int(actual_price), heads_for_memo.get(g) or {})
+                        if rr is not None:
+                            ratio_bits.append(f"{g}머리 {rr:.1f}%")
+                    if ratio_bits:
+                        memo_parts.append("[공식등급별 대비] " + " / ".join(ratio_bits))
 
                 record = {
                     "id": record_id,
@@ -5851,7 +6103,7 @@ def render_quality_encyclopedia_v24():
                     "markets": list(q_markets),
                     "benchmark": benchmark,
                     "benchmark_level": benchmark_result.get("level"),
-                    "benchmark_description": benchmark_result.get("description"),
+                    "benchmark_description": "가락 전체 동일단위 머리 · 전체등급",
                     "benchmark_company_count": int(benchmark_result.get("company_count") or 0),
                     "expected_price": int(expected_price or 0),
                     "actual_price": int(actual_price or 0),
@@ -6012,15 +6264,20 @@ def render_quality_encyclopedia_v24():
                 else:
                     ratio_text = f'{float(prem):+.1f}%'
                 m3.metric(
-                    "가락 머리 대비" if is_garak_head_record else "시세 대비",
+                    "가락 전체 머리 대비" if is_garak_head_record else "시세 대비",
                     ratio_text,
                 )
 
                 st.caption(
                     f'품종 {r.get("variety") or "—"} · '
-                    f'등급 {r.get("grade") or "—"} · '
+                    f'공식등급 {r.get("grade") or "—"} · '
                     f'기준 {r.get("benchmark_description") or "—"}'
                 )
+                if (
+                    is_garak_head_record
+                    and "전체등급" not in _v24_text(r.get("benchmark_description"))
+                ):
+                    st.caption("⚠️ v31 이전 기록은 기준등급이 전체/특/상 중 무엇인지 설명을 확인해야 합니다.")
 
                 if r.get("memo"):
                     st.write(r["memo"])
@@ -6103,8 +6360,8 @@ if mode == "🔍 세부규격 찾기":
     st.stop()
 
 st.title("가락·강서 경매조회")
-st.caption("✅ APP VERSION: v31-GARAK-HEAD-GRADE-1TO5")
-st.caption("⭐ 품목+출하지 즐겨찾기 · 📚 특/상/중 1~5 품위 · 📊 가락 머리 대비")
+st.caption("✅ APP VERSION: v32-EXPLICIT-GRADE-HEADS")
+st.caption("⭐ 특/상/중 1~5 품위 · 📊 전체/특/상/중 머리 대비를 각각 표시")
 
 default_item = qp_get("item", "")
 default_origin = qp_get("origin", "")
