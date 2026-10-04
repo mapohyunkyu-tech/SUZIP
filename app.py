@@ -5279,6 +5279,30 @@ def _uploaded_file_info_v24(uploaded, default_name: str) -> Tuple[bytes, str, st
     return raw, content_type, ext
 
 
+def _stored_camera_info_v25(payload: Dict[str, object]) -> Tuple[bytes, str, str]:
+    raw = payload.get("raw") or b""
+    content_type = str(payload.get("content_type") or "image/jpeg")
+    ext = str(payload.get("ext") or ".jpg")
+    return bytes(raw), content_type, ext
+
+
+def _save_camera_capture_v25(uploaded, slot: str):
+    if uploaded is None:
+        return False, "사진을 먼저 촬영해 주세요."
+    raw, content_type, ext = _uploaded_file_info_v24(uploaded, f"{slot}.jpg")
+    st.session_state[f"q25_saved_{slot}"] = {
+        "raw": raw,
+        "content_type": content_type,
+        "ext": ext,
+    }
+    return True, ""
+
+
+def _clear_camera_capture_v25(slot: str):
+    st.session_state.pop(f"q25_saved_{slot}", None)
+
+
+
 def render_quality_encyclopedia_v24():
     st.title("📚 품위 백과사전")
     st.caption(
@@ -5339,17 +5363,71 @@ def render_quality_encyclopedia_v24():
             st.info(f"📸 **{q_item} 촬영 가이드**\n\n① {g1}\n\n② {g2}")
 
         st.markdown("#### 사진 2장 권장")
-        p1, p2 = st.columns(2)
-        with p1:
-            overall_photo = st.camera_input("① 전체샷", key="q24_camera_overall")
-        with p2:
-            close_photo = st.camera_input("② 근접샷", key="q24_camera_close")
+        st.caption(
+            "모바일 브라우저는 카메라 2개를 동시에 열면 한쪽이 막힐 수 있어서 "
+            "**카메라 하나로 전체샷 → 근접샷 순서대로 저장**하게 바꿨습니다."
+        )
+
+        capture_mode = st.radio(
+            "촬영할 사진",
+            ["① 전체샷", "② 근접샷"],
+            horizontal=True,
+            key="q25_capture_mode",
+        )
+
+        active_slot = "overall" if capture_mode.startswith("①") else "close"
+        camera_photo = st.camera_input(
+            "📷 촬영",
+            key=f"q25_camera::{active_slot}",
+        )
+
+        save_col, clear_col = st.columns(2)
+        with save_col:
+            if st.button(
+                f"💾 {capture_mode} 저장",
+                use_container_width=True,
+                key=f"q25_save_capture::{active_slot}",
+            ):
+                ok_cap, msg_cap = _save_camera_capture_v25(camera_photo, active_slot)
+                if ok_cap:
+                    st.success(f"{capture_mode} 저장됨")
+                    st.rerun()
+                else:
+                    st.warning(msg_cap)
+
+        with clear_col:
+            saved_now = st.session_state.get(f"q25_saved_{active_slot}")
+            if st.button(
+                f"↩ {capture_mode} 다시 찍기",
+                use_container_width=True,
+                disabled=saved_now is None,
+                key=f"q25_clear_capture::{active_slot}",
+            ):
+                _clear_camera_capture_v25(active_slot)
+                st.rerun()
+
+        saved_overall = st.session_state.get("q25_saved_overall")
+        saved_close = st.session_state.get("q25_saved_close")
+
+        status_cols = st.columns(2)
+        with status_cols[0]:
+            if saved_overall:
+                st.success("✅ 전체샷 저장됨")
+                st.image(saved_overall["raw"], use_container_width=True)
+            else:
+                st.info("① 전체샷 미촬영")
+        with status_cols[1]:
+            if saved_close:
+                st.success("✅ 근접샷 저장됨")
+                st.image(saved_close["raw"], use_container_width=True)
+            else:
+                st.info("② 근접샷 미촬영")
 
         extra_photos = st.file_uploader(
             "추가 사진 (선택)",
             type=["jpg", "jpeg", "png", "webp"],
             accept_multiple_files=True,
-            key="q24_extra_photos",
+            key="q25_extra_photos",
         )
 
         benchmark_key = (
@@ -5464,12 +5542,14 @@ def render_quality_encyclopedia_v24():
             key="q24_save",
         ):
             photos = []
-            if overall_photo is not None:
-                photos.append(("전체", overall_photo))
-            if close_photo is not None:
-                photos.append(("근접", close_photo))
+            saved_overall = st.session_state.get("q25_saved_overall")
+            saved_close = st.session_state.get("q25_saved_close")
+            if saved_overall:
+                photos.append(("전체", saved_overall, "stored"))
+            if saved_close:
+                photos.append(("근접", saved_close, "stored"))
             for idx_extra, f in enumerate(extra_photos or [], start=1):
-                photos.append((f"추가{idx_extra}", f))
+                photos.append((f"추가{idx_extra}", f, "uploaded"))
 
             if not q_item:
                 st.error("품목을 입력해 주세요.")
@@ -5512,11 +5592,14 @@ def render_quality_encyclopedia_v24():
                     st.error(err_rec)
                 else:
                     failed = []
-                    for sort_order, (ptype, uploaded) in enumerate(photos):
-                        raw, content_type, ext = _uploaded_file_info_v24(
-                            uploaded,
-                            f"{ptype}{sort_order}.jpg",
-                        )
+                    for sort_order, (ptype, source, source_kind) in enumerate(photos):
+                        if source_kind == "stored":
+                            raw, content_type, ext = _stored_camera_info_v25(source)
+                        else:
+                            raw, content_type, ext = _uploaded_file_info_v24(
+                                source,
+                                f"{ptype}{sort_order}.jpg",
+                            )
                         storage_path = (
                             f'{q_item}/{q_date.strftime("%Y%m%d")}/'
                             f'{record_id}/{sort_order:02d}_{ptype}{ext}'
@@ -5550,6 +5633,9 @@ def render_quality_encyclopedia_v24():
                         )
                     else:
                         st.success("✅ 품위 기록과 사진을 Supabase에 영구 저장했습니다.")
+
+                    _clear_camera_capture_v25("overall")
+                    _clear_camera_capture_v25("close")
                     st.rerun()
 
     with tab_library:
@@ -5718,8 +5804,8 @@ if mode == "🔍 세부규격 찾기":
     st.stop()
 
 st.title("가락·강서 경매조회")
-st.caption("✅ APP VERSION: v24-SUPABASE-QUALITY-ENCYCLOPEDIA")
-st.caption("⭐ 품목+산지 즐겨찾기 · 📚 Supabase 영구저장 품위 백과사전")
+st.caption("✅ APP VERSION: v25-SINGLE-CAMERA-CAPTURE")
+st.caption("⭐ 품목+산지 즐겨찾기 · 📚 품위 백과사전 · 📷 모바일 단일카메라 순차촬영")
 
 default_item = qp_get("item", "")
 default_origin = qp_get("origin", "")
