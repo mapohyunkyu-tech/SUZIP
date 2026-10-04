@@ -3,6 +3,8 @@ import math
 import re
 import ipaddress
 import socket
+import uuid
+import mimetypes
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
@@ -572,6 +574,247 @@ def render_today_item_picker_v16(
             st.rerun()
 
 
+
+# =========================================================
+# v21: 산지(출하지) 검색
+# - 공개 결과의 '출하지' 컬럼을 기준으로 부분일치 필터
+# - 숨은 서버 파라미터를 추측하지 않고 실제 반환값만 사용
+# =========================================================
+def filter_origin_v21(df: pd.DataFrame, origin: str) -> pd.DataFrame:
+    origin = re.sub(r"\s+", " ", str(origin or "")).strip()
+    if df is None or df.empty or not origin:
+        return df
+
+    # 공백 차이 때문에 놓치지 않도록 양쪽 모두 공백 제거 후 포함검색
+    needle = re.sub(r"\s+", "", origin).lower()
+    series = (
+        df["출하지"]
+        .fillna("")
+        .astype(str)
+        .map(lambda x: re.sub(r"\s+", "", x).lower())
+    )
+    return df[series.str.contains(re.escape(needle), regex=True, na=False)].copy()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def probe_company_origin_v21(
+    date_yyyymmdd: str,
+    item: str,
+    origin: str,
+    market_name: str,
+    company_code: str,
+) -> int:
+    """
+    산지가 지정된 경우에는 해당 품목의 회사 전체 결과를 가져온 뒤
+    실제 '출하지' 컬럼에서 부분일치하는 행 수를 센다.
+    """
+    df = fetch_all_company_rows(
+        date_yyyymmdd,
+        item,
+        market_name,
+        company_code,
+    )
+    df = filter_origin_v21(df, origin)
+    return 0 if df is None or df.empty else int(len(df))
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def discover_company_status_v21(
+    date_yyyymmdd: str,
+    item: str,
+    markets: Tuple[str, ...],
+    origin: str = "",
+) -> List[Dict[str, str]]:
+    candidates: List[Dict[str, str]] = []
+    for market_name in markets:
+        _, opts = get_market_context(market_name)
+        candidates.extend(opts)
+
+    status_rows = []
+    workers = min(10, max(1, len(candidates)))
+    origin = re.sub(r"\s+", " ", str(origin or "")).strip()
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        if origin:
+            future_map = {
+                ex.submit(
+                    probe_company_origin_v21,
+                    date_yyyymmdd,
+                    item,
+                    origin,
+                    c["market"],
+                    c["code"],
+                ): c
+                for c in candidates
+            }
+        else:
+            future_map = {
+                ex.submit(
+                    probe_company,
+                    date_yyyymmdd,
+                    item,
+                    c["market"],
+                    c["code"],
+                ): c
+                for c in candidates
+            }
+
+        for fut in as_completed(future_map):
+            c = future_map[fut]
+            try:
+                count = int(fut.result())
+            except Exception:
+                count = 0
+
+            status_rows.append(
+                {
+                    **c,
+                    "first_page_count": count,
+                    "available": count > 0,
+                    "key": f'{c["market"]}|{c["code"]}',
+                }
+            )
+
+    market_rank = {"가락": 0, "강서": 1}
+    status_rows.sort(
+        key=lambda x: (
+            market_rank.get(x["market"], 99),
+            0 if x["available"] else 1,
+            x["name"],
+        )
+    )
+    return status_rows
+
+
+def render_company_v21(
+    company: Dict[str, str],
+    date_yyyymmdd: str,
+    item: str,
+    origin: str = "",
+) -> pd.DataFrame:
+    with st.spinner(f'{company["market"]} · {company["name"]} 전체 경매자료 불러오는 중...'):
+        df = fetch_all_company_rows(
+            date_yyyymmdd,
+            item,
+            company["market"],
+            company["code"],
+        )
+
+    df = filter_origin_v21(df, origin)
+
+    if df is None or df.empty:
+        if origin:
+            st.warning(f"`{origin}` 산지에 해당하는 경매자료가 없습니다.")
+        else:
+            st.warning("경매자료가 없습니다. 새로고침 후 다시 검색해 주세요.")
+        return pd.DataFrame()
+
+    df = df.copy()
+    df.insert(1, "법인", company["name"])
+
+    st.markdown(
+        f'<span class="market-badge">{company["market"]}</span>'
+        f'<strong>{company["name"]}</strong>',
+        unsafe_allow_html=True,
+    )
+
+    if origin:
+        st.caption(f"산지 필터: **{origin}** · 공개 결과의 `출하지` 부분일치")
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("경매건수", f"{len(df):,}건")
+    m2.metric("품종표기", f'{df["품목(품종)"].nunique():,}개')
+    m3.metric("가격범위", f'{df["경락가"].min():,} ~ {df["경락가"].max():,}')
+
+    st.caption("품종 → 단위 → 등급 순으로 표시합니다. 공개 경매결과에 보이는 정보만 사용합니다.")
+    st.markdown(
+        '<div class="price-legend">🔴 머리(최고가) &nbsp; 🟡 중간(실제 경락 중 중앙값) &nbsp; 🔵 꼬리(최저가)</div>',
+        unsafe_allow_html=True,
+    )
+
+    item_names = list(dict.fromkeys(df["품목(품종)"].tolist()))
+    for idx2, item_name in enumerate(item_names):
+        item_df = df[df["품목(품종)"] == item_name].copy()
+        with st.expander(
+            f'{item_name}  ·  {len(item_df):,}건',
+            expanded=(len(item_names) == 1 or idx2 == 0),
+        ):
+            units = list(dict.fromkeys(item_df["단위"].tolist()))
+            for unit in units:
+                unit_df = item_df[item_df["단위"] == unit].copy()
+                st.markdown(f"#### {unit}")
+
+                grades = sorted(
+                    unit_df["등급"].dropna().unique().tolist(),
+                    key=grade_rank,
+                )
+                for grade in grades:
+                    g = unit_df[unit_df["등급"] == grade].copy()
+                    g = g.sort_values(["경락가", "번호"], ascending=[False, False])
+                    prices = g["경락가"].astype(int).tolist()
+                    head = max(prices)
+                    middle = actual_middle_price(prices)
+                    tail = min(prices)
+                    avg = round(mean(prices))
+
+                    st.markdown(f"**{grade}** · {len(g):,}건")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("머리", f"{head:,}")
+                    c2.metric("중간", f"{middle:,}")
+                    c3.metric("꼬리", f"{tail:,}")
+                    c4.metric("평균", f"{avg:,}")
+
+                    view = g[["경락가", "출하지", "번호"]].copy()
+                    view.insert(
+                        0,
+                        "구간",
+                        [
+                            price_label(int(p), head, middle, tail)
+                            for p in view["경락가"]
+                        ],
+                    )
+                    st.dataframe(
+                        style_price_rows(view),
+                        use_container_width=True,
+                        hide_index=True,
+                        height=min(430, 42 + 35 * min(len(view), 11)),
+                    )
+
+    # 세부규격 보강은 품목/법인 기준 데이터라 기존 호출 유지
+    render_integrated_spec_v11(company, date_yyyymmdd, item)
+
+    with st.expander("이 법인 원자료 전체 보기"):
+        raw_view = df[
+            ["시장", "법인", "번호", "품목(품종)", "단위", "등급", "경락가", "출하지"]
+        ].sort_values(
+            ["품목(품종)", "단위", "등급", "경락가"],
+            ascending=[True, True, True, False],
+        )
+        st.dataframe(
+            raw_view.style.format({"경락가": "{:,.0f}"}),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    return df
+
+
+def safe_render_company_v21(
+    company: Dict[str, str],
+    date_yyyymmdd: str,
+    item: str,
+    origin: str = "",
+) -> pd.DataFrame:
+    try:
+        return render_company_v21(company, date_yyyymmdd, item, origin)
+    except Exception as e:
+        st.error(
+            f'{company["market"]} · {company["name"]} 상세 표시 중 오류가 발생했습니다.'
+        )
+        st.code(str(e))
+        return pd.DataFrame()
+
+
 # =========================================================
 # 표시 / 계산
 # =========================================================
@@ -857,6 +1100,123 @@ def render_compare_v14(frames: List[pd.DataFrame], selected_labels: List[str], s
             st.warning("⚠ 공개결과상 세부규격 미확인. 42/45망, 4내/4수 등이 섞였을 수 있어 참고가격 비교로 보세요.")
 
 
+
+# =========================================================
+# v22: 산지 지정 시 품종까지 같은 거래만 법인 비교
+# =========================================================
+def render_origin_variety_compare_v22(
+    frames: List[pd.DataFrame],
+    selected_labels: List[str],
+    search_item: str,
+    origin: str,
+):
+    st.markdown("## 📊 산지·품종별 법인 비교")
+    st.caption(
+        f"산지 `{origin}`로 필터한 뒤 **품목(품종) + 단위 + 등급**이 같은 거래끼리만 비교합니다."
+    )
+
+    if not frames:
+        st.error("비교용 거래자료가 없습니다.")
+        return
+
+    all_df = pd.concat(frames, ignore_index=True)
+    if all_df.empty:
+        st.error("비교용 거래자료가 없습니다.")
+        return
+
+    work = all_df.copy()
+    work["비교단위"] = work["단위"].map(_cmp_unit_v14)
+    work["비교등급"] = work["등급"].map(_cmp_grade_v14)
+    work["법인표시"] = work["시장"].astype(str) + " · " + work["법인"].astype(str)
+
+    out = []
+    for (variety, unit_key, grade_key), gg in work.groupby(
+        ["품목(품종)", "비교단위", "비교등급"],
+        dropna=False,
+        sort=False,
+    ):
+        if gg["법인표시"].nunique() < 2:
+            continue
+
+        for label, cg in gg.groupby("법인표시", sort=False):
+            prices = [
+                int(round(float(x)))
+                for x in cg["경락가"].tolist()
+                if pd.notna(x) and float(x) > 0
+            ]
+            if not prices:
+                continue
+
+            origins = " / ".join(
+                list(dict.fromkeys(cg["출하지"].fillna("").astype(str).tolist()))[:4]
+            )
+            out.append({
+                "품종": variety,
+                "단위": unit_key,
+                "등급": grade_key,
+                "법인": label,
+                "출하지": origins,
+                "건수": len(prices),
+                "머리": max(prices),
+                "중간": actual_middle_price(prices),
+                "꼬리": min(prices),
+                "평균": round(mean(prices)),
+            })
+
+    cdf = pd.DataFrame(out)
+    if cdf.empty:
+        st.warning(
+            "이 산지에서 법인 2곳 이상에 **품종·단위·등급까지 동일한 거래**가 없습니다. "
+            "아래 법인별 상세 탭에서 각각 확인해 주세요."
+        )
+        return
+
+    order = {x: i for i, x in enumerate(selected_labels)}
+    cdf["순서"] = cdf["법인"].map(order).fillna(9999).astype(int)
+
+    for (variety, unit_key, grade_key), g in cdf.groupby(
+        ["품종", "단위", "등급"],
+        sort=False,
+    ):
+        g = g.sort_values(["순서", "중간"], ascending=[True, False]).copy()
+
+        base = None
+        base_label = None
+        for label in selected_labels:
+            r = g[g["법인"] == label]
+            if not r.empty:
+                base = int(r.iloc[0]["중간"])
+                base_label = label
+                break
+
+        g["중간차이"] = g["중간"].astype(int) - (base if base is not None else 0)
+
+        st.markdown(f"### {variety} · {origin} · {unit_key} · {grade_key}")
+        view = g[
+            ["법인", "출하지", "건수", "머리", "중간", "중간차이", "꼬리", "평균"]
+        ].copy()
+        st.dataframe(
+            view.style.format({
+                "건수": "{:,.0f}",
+                "머리": "{:,.0f}",
+                "중간": "{:,.0f}",
+                "중간차이": "{:+,.0f}",
+                "꼬리": "{:,.0f}",
+                "평균": "{:,.0f}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if base_label:
+            st.caption(f"중간차이 기준: {base_label}")
+
+        if grade_key == "세부규격 미확인":
+            st.warning(
+                "⚠ 같은 산지·품종이어도 공개결과의 세부규격이 빠진 등급입니다. "
+                "42/45망, 4내/4수 등의 차이는 원천규격 확인 전까지 참고용입니다."
+            )
+
+
 # =========================================================
 # v15: 시세 약세 / 우리만 약세 진단
 # - '시장 전체'라고 단정하지 않고 선택한 타 법인 기준으로 진단
@@ -920,6 +1280,7 @@ def _fetch_company_frame_v15(
     company: Dict[str, str],
     ymd: str,
     item: str,
+    origin: str = "",
 ) -> pd.DataFrame:
     df = fetch_all_company_rows(
         ymd,
@@ -927,8 +1288,9 @@ def _fetch_company_frame_v15(
         company["market"],
         company["code"],
     )
-    if df.empty:
-        return df
+    df = filter_origin_v21(df, origin)
+    if df is None or df.empty:
+        return pd.DataFrame()
     df = df.copy()
     if "법인" not in df.columns:
         df.insert(1, "법인", company["name"])
@@ -985,6 +1347,7 @@ def build_weakness_diagnosis_v15(
     our_label: str,
     search_date: str,
     item: str,
+    origin: str,
     lookback_markets: int,
     threshold_pct: float,
     max_calendar_scan: int = 21,
@@ -1052,7 +1415,7 @@ def build_weakness_diagnosis_v15(
             if not company:
                 continue
             try:
-                hdf = _fetch_company_frame_v15(company, ymd, item)
+                hdf = _fetch_company_frame_v15(company, ymd, item, origin)
             except Exception:
                 continue
             if hdf.empty:
@@ -1157,12 +1520,19 @@ def render_weakness_diagnosis_v15(
     selected_labels: List[str],
     search_date: str,
     item: str,
+    origin: str = "",
 ):
     st.markdown("## 📉 시세 약세 / 우리만 약세 진단")
     st.caption(
         "선택한 법인들만 기준으로 봅니다. `시장 전체`를 단정하는 기능은 아닙니다. "
         "오늘 타 법인 중간가와 최근 장들의 타 법인 일별 중간가를 비교합니다."
     )
+    if origin:
+        st.caption(
+            f"산지 `{origin}` 필터는 적용됩니다. 다만 약세진단은 같은 산지 안의 "
+            "`단위+등급` 기준이므로 여러 품종이 있으면 합쳐질 수 있습니다. "
+            "위 `산지·품종별 법인 비교`가 더 엄격한 비교입니다."
+        )
 
     if len(selected_labels) < 2:
         st.info("법인을 2곳 이상 선택하면 진단할 수 있습니다.")
@@ -1224,6 +1594,7 @@ def render_weakness_diagnosis_v15(
             our_label,
             search_date,
             item,
+            origin,
             lookback,
             float(threshold),
         )
@@ -3526,6 +3897,540 @@ def favorite_status_v20(
     return [results[item] for item in favorites]
 
 
+
+
+# =========================================================
+# v22: 즐겨찾기 = 품목 + 산지 세트
+# =========================================================
+def _clean_pair_text_v22(v: str) -> str:
+    return re.sub(r"\s+", " ", str(v or "")).strip()
+
+
+def _pair_key_v22(item: str, origin: str) -> str:
+    return f"{_clean_pair_text_v22(item)}||{_clean_pair_text_v22(origin)}"
+
+
+def _pair_label_v22(item: str, origin: str) -> str:
+    item = _clean_pair_text_v22(item)
+    origin = _clean_pair_text_v22(origin)
+    return f"{item} · {origin}" if origin else f"{item} · 전체산지"
+
+
+def _clean_favorite_pairs_v22(values: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    seen = set()
+    for row in values:
+        item = _clean_pair_text_v22(row.get("item", ""))
+        origin = _clean_pair_text_v22(row.get("origin", ""))
+        if not item:
+            continue
+        key = _pair_key_v22(item, origin).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"item": item, "origin": origin})
+    return out
+
+
+def load_favorite_pairs_v22() -> List[Dict[str, str]]:
+    # v22 전용 URL 저장값
+    raw = qp_get("favpairs", "")
+    if raw.strip():
+        pairs = []
+        for chunk in raw.split(","):
+            if not chunk:
+                continue
+            if "~" in chunk:
+                a, b = chunk.split("~", 1)
+            else:
+                a, b = chunk, ""
+            pairs.append({
+                "item": unquote(a).strip(),
+                "origin": unquote(b).strip(),
+            })
+        pairs = _clean_favorite_pairs_v22(pairs)
+        if pairs:
+            return pairs
+
+    saved = st.session_state.get("favorite_pairs_v22")
+    if isinstance(saved, list) and saved:
+        return _clean_favorite_pairs_v22(saved)
+
+    # 이전 버전 즐겨찾기는 '전체산지' 조합으로 자동 승계
+    old_items = load_favorites_v18()
+    return _clean_favorite_pairs_v22(
+        [{"item": x, "origin": ""} for x in old_items]
+    )
+
+
+def save_favorite_pairs_v22(values: List[Dict[str, str]]):
+    pairs = _clean_favorite_pairs_v22(values)
+    st.session_state["favorite_pairs_v22"] = pairs
+    encoded = ",".join(
+        f'{quote(x["item"], safe="")}~{quote(x["origin"], safe="")}'
+        for x in pairs
+    )
+    qp_set(favpairs=encoded)
+
+
+def _favorite_pair_signature_v22(values: List[Dict[str, str]]) -> str:
+    return "|".join(_pair_key_v22(x["item"], x["origin"]) for x in values)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def favorite_pair_status_v22(
+    date_yyyymmdd: str,
+    favorite_pairs: Tuple[Tuple[str, str], ...],
+    markets: Tuple[str, ...],
+) -> List[Dict[str, object]]:
+    """
+    각 즐겨찾기(품목+산지) 조합을 직접 품목검색과 같은 법인별 방식으로 확인.
+    산지가 있으면 실제 반환된 '출하지'를 필터한다.
+    """
+    candidates: List[Dict[str, str]] = []
+    for market_name in markets:
+        try:
+            _, opts = get_market_context(market_name)
+            candidates.extend(opts)
+        except Exception:
+            continue
+
+    results: Dict[str, Dict[str, object]] = {}
+    for item, origin in favorite_pairs:
+        key = _pair_key_v22(item, origin)
+        results[key] = {
+            "key": key,
+            "item": item,
+            "origin": origin,
+            "available": False,
+            "markets": [],
+            "company_labels": [],
+            "company_count": 0,
+            "rows": 0,
+        }
+
+    jobs = [(item, origin, c) for item, origin in favorite_pairs for c in candidates]
+    if not jobs:
+        return [results[_pair_key_v22(i, o)] for i, o in favorite_pairs]
+
+    workers = min(12, max(1, len(jobs)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        future_map = {}
+        for item, origin, c in jobs:
+            if origin:
+                fut = ex.submit(
+                    probe_company_origin_v21,
+                    date_yyyymmdd,
+                    item,
+                    origin,
+                    c["market"],
+                    c["code"],
+                )
+            else:
+                fut = ex.submit(
+                    probe_company,
+                    date_yyyymmdd,
+                    item,
+                    c["market"],
+                    c["code"],
+                )
+            future_map[fut] = (item, origin, c)
+
+        for fut in as_completed(future_map):
+            item, origin, c = future_map[fut]
+            try:
+                count = int(fut.result())
+            except Exception:
+                count = 0
+            if count <= 0:
+                continue
+
+            slot = results[_pair_key_v22(item, origin)]
+            slot["available"] = True
+            slot["rows"] += count
+
+            if c["market"] not in slot["markets"]:
+                slot["markets"].append(c["market"])
+
+            label = f'{c["market"]} · {c["name"]}'
+            if label not in slot["company_labels"]:
+                slot["company_labels"].append(label)
+
+    for slot in results.values():
+        slot["markets"] = sorted(slot["markets"])
+        slot["company_labels"] = sorted(slot["company_labels"])
+        slot["company_count"] = len(slot["company_labels"])
+
+    return [results[_pair_key_v22(i, o)] for i, o in favorite_pairs]
+
+
+def render_favorites_v22(
+    date_yyyymmdd: str,
+    markets: Tuple[str, ...],
+    suggested_origin: str = "",
+):
+    st.divider()
+    st.subheader("⭐ 즐겨찾기 빠른조회")
+    st.caption(
+        "이제 즐겨찾기를 **품목 + 산지**로 저장합니다. "
+        "예: `표고 · 부여`, `상추 · 논산`, `아스파라거스 · 양구`."
+    )
+
+    pairs = load_favorite_pairs_v22()
+    st.session_state["favorite_pairs_v22"] = pairs
+
+    with st.expander("⭐ 즐겨찾기 관리", expanded=False):
+        a, b = st.columns(2)
+        with a:
+            new_item = st.text_input(
+                "품목",
+                placeholder="예: 표고",
+                key="fav_item_add_v22",
+            ).strip()
+        with b:
+            new_origin = st.text_input(
+                "산지",
+                value=_clean_pair_text_v22(suggested_origin),
+                placeholder="예: 부여 (비우면 전체산지)",
+                key="fav_origin_add_v22",
+            ).strip()
+
+        if st.button(
+            "➕ 품목+산지 즐겨찾기 추가",
+            use_container_width=True,
+            key="fav_pair_add_btn_v22",
+        ):
+            if new_item:
+                updated = pairs + [{"item": new_item, "origin": new_origin}]
+                save_favorite_pairs_v22(updated)
+                favorite_pair_status_v22.clear()
+                st.rerun()
+
+        labels = [_pair_label_v22(x["item"], x["origin"]) for x in pairs]
+        label_to_pair = {
+            _pair_label_v22(x["item"], x["origin"]): x
+            for x in pairs
+        }
+        remove_labels = st.multiselect(
+            "삭제할 즐겨찾기",
+            options=labels,
+            key="fav_pair_remove_v22",
+        )
+        if st.button(
+            "🗑 선택 삭제",
+            use_container_width=True,
+            disabled=not remove_labels,
+            key="fav_pair_remove_btn_v22",
+        ):
+            remove_keys = {
+                _pair_key_v22(
+                    label_to_pair[x]["item"],
+                    label_to_pair[x]["origin"],
+                )
+                for x in remove_labels
+            }
+            updated = [
+                x for x in pairs
+                if _pair_key_v22(x["item"], x["origin"]) not in remove_keys
+            ]
+            save_favorite_pairs_v22(updated)
+            favorite_pair_status_v22.clear()
+            st.rerun()
+
+    if not pairs:
+        st.info("즐겨찾기를 하나 이상 추가해 주세요.")
+        return
+
+    st.markdown(
+        "**현재 즐겨찾기:** "
+        + " · ".join(
+            f'`{_pair_label_v22(x["item"], x["origin"])}`'
+            for x in pairs
+        )
+    )
+
+    signature = _favorite_pair_signature_v22(pairs)
+    status_key = (
+        f'fav_pair_status_v22::{date_yyyymmdd}::{"|".join(markets)}::{signature}'
+    )
+
+    if st.button(
+        "⚡ 오늘 경매여부 확인",
+        type="primary",
+        use_container_width=True,
+        key=f"fav_pair_check_v22::{date_yyyymmdd}::{','.join(markets)}",
+    ):
+        pair_tuple = tuple((x["item"], x["origin"]) for x in pairs)
+        with st.spinner("즐겨찾기 품목+산지를 법인별로 확인 중..."):
+            statuses = favorite_pair_status_v22(
+                date_yyyymmdd,
+                pair_tuple,
+                tuple(markets),
+            )
+        st.session_state[status_key] = statuses
+
+    statuses = st.session_state.get(status_key)
+    if statuses is None:
+        st.info("추가/수정 후 **오늘 경매여부 확인**을 눌러 주세요.")
+        return
+
+    for row in statuses:
+        item = str(row.get("item", ""))
+        origin = str(row.get("origin", ""))
+        available = bool(row.get("available", False))
+        company_count = int(row.get("company_count", 0))
+        company_labels = list(row.get("company_labels", []))
+
+        base_label = _pair_label_v22(item, origin)
+        if available:
+            label = f"✅ {base_label} · {company_count}법인"
+        else:
+            label = f"— {base_label} · 미확인"
+
+        clicked = st.button(
+            label,
+            disabled=not available,
+            type="primary" if available else "secondary",
+            use_container_width=True,
+            key=f"fav_pair_pick_v22::{date_yyyymmdd}::{_pair_key_v22(item, origin)}",
+        )
+
+        if available and company_labels:
+            st.caption("확인 법인: " + " · ".join(company_labels))
+
+        if clicked and available:
+            st.session_state["search"] = {
+                "date": date_yyyymmdd,
+                "item": item,
+                "origin": origin,
+                "markets": tuple(markets),
+            }
+            st.session_state.pop("favorites_request_v19", None)
+            st.session_state.pop("item_picker_request_v16", None)
+
+            for k in list(st.session_state.keys()):
+                if str(k).startswith("corp_selected::"):
+                    st.session_state.pop(k, None)
+
+            qp_set(
+                date=date_yyyymmdd,
+                item=item,
+                origin=origin,
+                markets=",".join(markets),
+            )
+            st.rerun()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def favorite_status_v21(
+    date_yyyymmdd: str,
+    favorites: Tuple[str, ...],
+    markets: Tuple[str, ...],
+    origin: str = "",
+) -> List[Dict[str, object]]:
+    candidates: List[Dict[str, str]] = []
+    for market_name in markets:
+        try:
+            _, opts = get_market_context(market_name)
+            candidates.extend(opts)
+        except Exception:
+            continue
+
+    origin = re.sub(r"\s+", " ", str(origin or "")).strip()
+    results: Dict[str, Dict[str, object]] = {
+        item: {
+            "item": item,
+            "available": False,
+            "markets": [],
+            "company_labels": [],
+            "company_count": 0,
+            "rows": 0,
+        }
+        for item in favorites
+    }
+
+    jobs = [(item, c) for item in favorites for c in candidates]
+    if not jobs:
+        return [results[item] for item in favorites]
+
+    workers = min(12, max(1, len(jobs)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        future_map = {}
+        for item, c in jobs:
+            if origin:
+                fut = ex.submit(
+                    probe_company_origin_v21,
+                    date_yyyymmdd,
+                    item,
+                    origin,
+                    c["market"],
+                    c["code"],
+                )
+            else:
+                fut = ex.submit(
+                    probe_company,
+                    date_yyyymmdd,
+                    item,
+                    c["market"],
+                    c["code"],
+                )
+            future_map[fut] = (item, c)
+
+        for fut in as_completed(future_map):
+            item, c = future_map[fut]
+            try:
+                count = int(fut.result())
+            except Exception:
+                count = 0
+            if count <= 0:
+                continue
+
+            slot = results[item]
+            slot["available"] = True
+            slot["rows"] += count
+            if c["market"] not in slot["markets"]:
+                slot["markets"].append(c["market"])
+            label = f'{c["market"]} · {c["name"]}'
+            if label not in slot["company_labels"]:
+                slot["company_labels"].append(label)
+
+    for item in favorites:
+        slot = results[item]
+        slot["markets"] = sorted(slot["markets"])
+        slot["company_labels"] = sorted(slot["company_labels"])
+        slot["company_count"] = len(slot["company_labels"])
+
+    return [results[item] for item in favorites]
+
+
+def render_favorites_v21(
+    date_yyyymmdd: str,
+    markets: Tuple[str, ...],
+    origin: str = "",
+):
+    st.divider()
+    st.subheader("⭐ 즐겨찾기 빠른조회")
+    if origin:
+        st.caption(
+            f"산지 **{origin}**까지 같이 확인합니다. "
+            "즐겨찾기 품목 × 법인 결과의 `출하지`에서 부분일치하는 건만 ✅ 처리합니다."
+        )
+    else:
+        st.caption(
+            "직접 품목 검색과 같은 법인별 조회 방식으로 오늘 경매 여부를 확인합니다."
+        )
+
+    favorites = load_favorites_v18()
+    st.session_state["favorites_v18"] = favorites
+
+    with st.expander("⭐ 즐겨찾기 관리", expanded=False):
+        new_item = st.text_input(
+            "품목 추가",
+            placeholder="예: 표고, 상추, 아스파라거스",
+            key="fav_add_v21",
+        ).strip()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("➕ 추가", use_container_width=True, key="fav_add_btn_v21"):
+                if new_item:
+                    save_favorites_v18(_clean_favorites_v18(favorites + [new_item]))
+                    favorite_status_v21.clear()
+                    st.rerun()
+        with c2:
+            if st.button("기본값", use_container_width=True, key="fav_reset_btn_v21"):
+                save_favorites_v18(list(DEFAULT_FAVORITES_V18))
+                favorite_status_v21.clear()
+                st.rerun()
+
+        remove_items = st.multiselect(
+            "삭제할 품목",
+            options=favorites,
+            key="fav_remove_v21",
+        )
+        if st.button(
+            "🗑 선택 삭제",
+            use_container_width=True,
+            disabled=not remove_items,
+            key="fav_remove_btn_v21",
+        ):
+            save_favorites_v18([x for x in favorites if x not in set(remove_items)])
+            favorite_status_v21.clear()
+            st.rerun()
+
+    if not favorites:
+        st.info("즐겨찾기 품목을 하나 이상 추가해 주세요.")
+        return
+
+    status_key = (
+        f'fav_status_v21::{date_yyyymmdd}::{"|".join(markets)}::{origin}::'
+        + _fav_signature_v19(favorites)
+    )
+
+    if st.button(
+        "⚡ 오늘 경매여부 확인",
+        type="primary",
+        use_container_width=True,
+        key=f"fav_check_v21::{date_yyyymmdd}::{','.join(markets)}::{origin}",
+    ):
+        with st.spinner("즐겨찾기 품목을 법인별로 확인 중..."):
+            statuses = favorite_status_v21(
+                date_yyyymmdd,
+                tuple(favorites),
+                tuple(markets),
+                origin,
+            )
+        st.session_state[status_key] = statuses
+
+    statuses = st.session_state.get(status_key)
+    if statuses is None:
+        st.info("즐겨찾기 추가/수정 후 **오늘 경매여부 확인**을 눌러 주세요.")
+        st.markdown("**현재 즐겨찾기:** " + " · ".join(favorites))
+        return
+
+    for row in statuses:
+        item = str(row.get("item", ""))
+        available = bool(row.get("available", False))
+        company_labels = list(row.get("company_labels", []))
+        company_count = int(row.get("company_count", 0))
+
+        label = (
+            f"✅ {item} · {company_count}법인"
+            if available
+            else f"— {item} · 미확인"
+        )
+        clicked = st.button(
+            label,
+            disabled=not available,
+            type="primary" if available else "secondary",
+            use_container_width=True,
+            key=f"fav_pick_v21::{date_yyyymmdd}::{origin}::{item}",
+        )
+
+        if available and company_labels:
+            st.caption("확인 법인: " + " · ".join(company_labels))
+
+        if clicked and available:
+            st.session_state["search"] = {
+                "date": date_yyyymmdd,
+                "item": item,
+                "origin": origin,
+                "markets": tuple(markets),
+            }
+            st.session_state.pop("favorites_request_v19", None)
+            st.session_state.pop("item_picker_request_v16", None)
+            for k in list(st.session_state.keys()):
+                if str(k).startswith("corp_selected::"):
+                    st.session_state.pop(k, None)
+            qp_set(
+                date=date_yyyymmdd,
+                item=item,
+                origin=origin,
+                markets=",".join(markets),
+            )
+            st.rerun()
+
+
 def render_favorites_v20(
     date_yyyymmdd: str,
     markets: Tuple[str, ...],
@@ -3892,10 +4797,887 @@ def safe_render_company_v19(
         return pd.DataFrame()
 
 
+
+# =========================================================
+# v24: Supabase 영구저장형 📚 품위 백과사전
+# - 사진: Supabase Storage private bucket
+# - 메타데이터: quality_records / quality_photos
+# - 앱 재배포/재부팅 후에도 유지
+# =========================================================
+
+def _v24_text(v) -> str:
+    return re.sub(r"\s+", " ", str(v or "")).strip()
+
+
+def _supabase_config_v24() -> Tuple[str, str, str]:
+    try:
+        url = str(st.secrets.get("SUPABASE_URL", "") or "").strip().rstrip("/")
+        key = str(st.secrets.get("SUPABASE_SECRET_KEY", "") or "").strip()
+        bucket = str(st.secrets.get("SUPABASE_BUCKET", "quality-images") or "quality-images").strip()
+    except Exception:
+        url, key, bucket = "", "", "quality-images"
+    return url, key, bucket
+
+
+def _supabase_headers_v24(extra: Dict[str, str] = None) -> Dict[str, str]:
+    url, key, _ = _supabase_config_v24()
+    h = {
+        "apikey": key,
+        "Accept": "application/json",
+    }
+    # 예전 service_role JWT를 쓰는 경우에만 Bearer 헤더도 추가.
+    if key and not key.startswith("sb_secret_"):
+        h["Authorization"] = f"Bearer {key}"
+    if extra:
+        h.update(extra)
+    return h
+
+
+def _supabase_ready_v24() -> bool:
+    url, key, bucket = _supabase_config_v24()
+    return bool(url and key and bucket)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def supabase_connection_test_v24() -> Tuple[bool, str]:
+    if not _supabase_ready_v24():
+        return False, "Streamlit Secrets에 SUPABASE_URL / SUPABASE_SECRET_KEY / SUPABASE_BUCKET이 필요합니다."
+
+    url, _, bucket = _supabase_config_v24()
+    try:
+        r = requests.get(
+            f"{url}/rest/v1/quality_records",
+            headers=_supabase_headers_v24(),
+            params={"select": "id", "limit": "1"},
+            timeout=20,
+        )
+        if r.status_code >= 400:
+            return False, f"DB 연결 실패: HTTP {r.status_code} · {r.text[:240]}"
+
+        # Storage bucket 자체가 존재하는지도 확인
+        s = requests.get(
+            f"{url}/storage/v1/bucket/{bucket}",
+            headers=_supabase_headers_v24(),
+            timeout=20,
+        )
+        if s.status_code >= 400:
+            return False, f"Storage 연결 실패: HTTP {s.status_code} · {s.text[:240]}"
+
+        return True, "Supabase DB + Storage 연결 정상"
+    except Exception as e:
+        return False, f"Supabase 연결 오류: {e}"
+
+
+def supabase_insert_record_v24(record: Dict[str, object]) -> Tuple[bool, str]:
+    url, _, _ = _supabase_config_v24()
+    try:
+        r = requests.post(
+            f"{url}/rest/v1/quality_records",
+            headers=_supabase_headers_v24({
+                "Content-Type": "application/json",
+                "Prefer": "return=representation",
+            }),
+            json=record,
+            timeout=25,
+        )
+        if r.status_code >= 400:
+            return False, f"기록 저장 실패: HTTP {r.status_code} · {r.text[:400]}"
+        return True, ""
+    except Exception as e:
+        return False, f"기록 저장 오류: {e}"
+
+
+def supabase_insert_photo_row_v24(row: Dict[str, object]) -> Tuple[bool, str]:
+    url, _, _ = _supabase_config_v24()
+    try:
+        r = requests.post(
+            f"{url}/rest/v1/quality_photos",
+            headers=_supabase_headers_v24({
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            }),
+            json=row,
+            timeout=25,
+        )
+        if r.status_code >= 400:
+            return False, f"사진 메타 저장 실패: HTTP {r.status_code} · {r.text[:400]}"
+        return True, ""
+    except Exception as e:
+        return False, f"사진 메타 저장 오류: {e}"
+
+
+def supabase_upload_photo_v24(
+    path: str,
+    raw: bytes,
+    content_type: str,
+) -> Tuple[bool, str]:
+    url, _, bucket = _supabase_config_v24()
+    safe_path = "/".join(quote(x, safe="") for x in path.split("/"))
+    try:
+        r = requests.post(
+            f"{url}/storage/v1/object/{quote(bucket, safe='')}/{safe_path}",
+            headers=_supabase_headers_v24({
+                "Content-Type": content_type or "image/jpeg",
+                "x-upsert": "false",
+            }),
+            data=raw,
+            timeout=45,
+        )
+        if r.status_code >= 400:
+            return False, f"사진 업로드 실패: HTTP {r.status_code} · {r.text[:400]}"
+        return True, ""
+    except Exception as e:
+        return False, f"사진 업로드 오류: {e}"
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def supabase_fetch_photo_v24(storage_path: str) -> bytes:
+    url, _, bucket = _supabase_config_v24()
+    safe_path = "/".join(quote(x, safe="") for x in storage_path.split("/"))
+    r = requests.get(
+        f"{url}/storage/v1/object/{quote(bucket, safe='')}/{safe_path}",
+        headers=_supabase_headers_v24(),
+        timeout=30,
+    )
+    r.raise_for_status()
+    return r.content
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def supabase_list_records_v24(limit: int = 300) -> List[Dict[str, object]]:
+    if not _supabase_ready_v24():
+        return []
+    url, _, _ = _supabase_config_v24()
+    params = {
+        "select": "*",
+        "order": "market_date.desc,created_at.desc",
+        "limit": str(limit),
+    }
+    r = requests.get(
+        f"{url}/rest/v1/quality_records",
+        headers=_supabase_headers_v24(),
+        params=params,
+        timeout=25,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, list) else []
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def supabase_list_photos_v24(record_id: str) -> List[Dict[str, object]]:
+    if not _supabase_ready_v24():
+        return []
+    url, _, _ = _supabase_config_v24()
+    params = {
+        "select": "*",
+        "record_id": f"eq.{record_id}",
+        "order": "sort_order.asc,created_at.asc",
+    }
+    r = requests.get(
+        f"{url}/rest/v1/quality_photos",
+        headers=_supabase_headers_v24(),
+        params=params,
+        timeout=25,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return data if isinstance(data, list) else []
+
+
+def supabase_update_actual_price_v24(
+    record_id: str,
+    actual_price: int,
+    premium_pct: float,
+) -> Tuple[bool, str]:
+    url, _, _ = _supabase_config_v24()
+    try:
+        r = requests.patch(
+            f"{url}/rest/v1/quality_records",
+            headers=_supabase_headers_v24({
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            }),
+            params={"id": f"eq.{record_id}"},
+            json={
+                "actual_price": int(actual_price),
+                "premium_pct": round(float(premium_pct), 2),
+            },
+            timeout=25,
+        )
+        if r.status_code >= 400:
+            return False, f"낙찰가 업데이트 실패: HTTP {r.status_code} · {r.text[:400]}"
+        supabase_list_records_v24.clear()
+        return True, ""
+    except Exception as e:
+        return False, f"낙찰가 업데이트 오류: {e}"
+
+
+def _quality_filter_v24(
+    df: pd.DataFrame,
+    origin: str = "",
+    variety: str = "",
+    unit: str = "",
+    grade: str = "",
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    out = df.copy()
+    if origin:
+        out = filter_origin_v21(out, origin)
+
+    if variety and not out.empty:
+        needle = re.sub(r"\s+", "", variety).lower()
+        s = (
+            out["품목(품종)"].fillna("").astype(str)
+            .map(lambda x: re.sub(r"\s+", "", x).lower())
+        )
+        out = out[s.str.contains(re.escape(needle), regex=True, na=False)].copy()
+
+    if unit and not out.empty:
+        ukey = _cmp_unit_v14(unit)
+        out = out[out["단위"].map(_cmp_unit_v14) == ukey].copy()
+
+    if grade and not out.empty:
+        gkey = _cmp_grade_v14(grade)
+        out = out[out["등급"].map(_cmp_grade_v14) == gkey].copy()
+
+    return out
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def build_quality_benchmark_v24(
+    date_yyyymmdd: str,
+    item: str,
+    origin: str,
+    markets: Tuple[str, ...],
+    variety: str = "",
+    unit: str = "",
+    grade: str = "",
+) -> Dict[str, object]:
+    item = _v24_text(item)
+    origin = _v24_text(origin)
+    variety = _v24_text(variety)
+    unit = _v24_text(unit)
+    grade = _v24_text(grade)
+
+    if not item or not markets:
+        return {"ok": False, "message": "품목과 시장을 선택해 주세요."}
+
+    candidates = []
+    for market_name in markets:
+        try:
+            _, opts = get_market_context(market_name)
+            candidates.extend(opts)
+        except Exception:
+            continue
+
+    if not candidates:
+        return {"ok": False, "message": "법인 목록을 가져오지 못했습니다."}
+
+    frames: Dict[str, pd.DataFrame] = {}
+    workers = min(10, max(1, len(candidates)))
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        fmap = {
+            ex.submit(
+                fetch_all_company_rows,
+                date_yyyymmdd,
+                item,
+                c["market"],
+                c["code"],
+            ): c
+            for c in candidates
+        }
+        for fut in as_completed(fmap):
+            c = fmap[fut]
+            try:
+                df = fut.result()
+            except Exception:
+                df = pd.DataFrame()
+            if df is not None and not df.empty:
+                frames[f'{c["market"]} · {c["name"]}'] = df
+
+    if not frames:
+        return {"ok": False, "message": "오늘 해당 품목 경매자료를 찾지 못했습니다."}
+
+    raw_levels = [
+        ("A", "같은 산지·품종·단위·등급", origin, variety, unit, grade),
+        ("B", "같은 산지·단위·등급", origin, "", unit, grade),
+        ("C", "같은 단위·등급", "", "", unit, grade),
+        ("D", "같은 산지·품목", origin, "", "", ""),
+        ("E", "같은 품목 전체", "", "", "", ""),
+    ]
+
+    levels = []
+    seen = set()
+    for code, desc, o, v, u, g in raw_levels:
+        sig = (o, v, u, g)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        levels.append((code, desc, o, v, u, g))
+
+    for code, desc, o, v, u, g in levels:
+        company_rows = []
+        for label, df in frames.items():
+            f = _quality_filter_v24(df, o, v, u, g)
+            if f.empty:
+                continue
+
+            prices = []
+            for x in f["경락가"].tolist():
+                try:
+                    if pd.notna(x) and float(x) > 0:
+                        prices.append(int(round(float(x))))
+                except Exception:
+                    pass
+            if not prices:
+                continue
+
+            company_rows.append({
+                "법인": label,
+                "건수": len(prices),
+                "중간": actual_middle_price(prices),
+                "머리": max(prices),
+                "꼬리": min(prices),
+                "평균": round(mean(prices)),
+            })
+
+        if company_rows:
+            mids = [int(x["중간"]) for x in company_rows]
+            return {
+                "ok": True,
+                "level": code,
+                "description": desc,
+                "company_count": len(company_rows),
+                "benchmark": actual_middle_price(mids),
+                "company_middle_min": min(mids),
+                "company_middle_max": max(mids),
+                "companies": company_rows,
+            }
+
+    return {"ok": False, "message": "조건에 맞는 기준시세를 만들 수 없습니다."}
+
+
+def _quality_record_matches_v24(
+    r: Dict[str, object],
+    item: str,
+    origin: str,
+    variety: str,
+    unit: str,
+    grade: str,
+    quality: str,
+) -> bool:
+    if _v24_text(r.get("item")).lower() != _v24_text(item).lower():
+        return False
+
+    if origin and _v24_text(r.get("origin")).lower() != _v24_text(origin).lower():
+        return False
+
+    if variety and _v24_text(r.get("variety")).lower() != _v24_text(variety).lower():
+        return False
+
+    if unit and _cmp_unit_v14(r.get("unit", "")) != _cmp_unit_v14(unit):
+        return False
+
+    if grade and _cmp_grade_v14(r.get("grade", "")) != _cmp_grade_v14(grade):
+        return False
+
+    if quality and quality != "미판정" and _v24_text(r.get("quality")) != quality:
+        return False
+
+    return r.get("premium_pct") is not None
+
+
+def quality_reference_v24(
+    benchmark: int,
+    records: List[Dict[str, object]],
+    item: str,
+    origin: str,
+    variety: str,
+    unit: str,
+    grade: str,
+    quality: str,
+) -> Dict[str, object]:
+    matches = [
+        r for r in records
+        if _quality_record_matches_v24(
+            r, item, origin, variety, unit, grade, quality
+        )
+    ]
+
+    vals = []
+    for r in matches:
+        try:
+            vals.append(float(r.get("premium_pct")))
+        except Exception:
+            pass
+
+    if benchmark <= 0 or len(vals) < 3:
+        return {"ok": False, "count": len(vals)}
+
+    vals = sorted(vals)
+    n = len(vals)
+    med = vals[n // 2]
+    q1 = vals[max(0, int((n - 1) * 0.25))]
+    q3 = vals[min(n - 1, int((n - 1) * 0.75))]
+
+    low = round(benchmark * (1 + q1 / 100))
+    center = round(benchmark * (1 + med / 100))
+    high = round(benchmark * (1 + q3 / 100))
+    if low > high:
+        low, high = high, low
+
+    return {
+        "ok": True,
+        "count": n,
+        "median_premium": med,
+        "low": low,
+        "center": center,
+        "high": high,
+    }
+
+
+def shooting_guide_v24(item: str) -> Tuple[str, str]:
+    t = _v24_text(item)
+    exact = {
+        "표고": ("전체 상자/트레이가 화면 70~80% 차게 위에서 1장", "대표 몇 개의 갓·자루·벌어짐이 보이게 근접 1장"),
+        "양배추": ("망/박스 전체와 크기 균일도가 보이게 1장", "대표 구의 결구·외엽·상처가 보이게 근접 1장"),
+        "고구마": ("상자 전체와 크기 분포가 보이게 1장", "대표 5개 정도의 형상·상처·피부 상태가 보이게 1장"),
+        "감자": ("상자 전체와 크기 분포가 보이게 1장", "대표 5개 정도의 기형·녹변·상처가 보이게 1장"),
+        "당근": ("상자 전체와 굵기/길이 균일도가 보이게 1장", "대표 5개 정도의 갈라짐·상처·색이 보이게 1장"),
+        "오이": ("여러 개의 길이·굵기·휘어짐이 한눈에 보이게 1장", "대표 3~5개의 색·가시·상처가 보이게 근접 1장"),
+        "상추": ("묶음/박스 전체의 양과 균일도가 보이게 1장", "잎끝·변색·짓무름·선도가 보이게 근접 1장"),
+        "쪽파": ("단 전체의 길이·굵기·정렬 상태가 보이게 1장", "뿌리·줄기·잎끝의 황변/시듦이 보이게 1장"),
+        "대파": ("단 전체의 길이·굵기·백경 비율이 보이게 1장", "뿌리·백경·잎끝 상태가 보이게 근접 1장"),
+    }
+    if t in exact:
+        return exact[t]
+
+    # 키워드 기반 기본 가이드
+    if any(k in t for k in ["버섯", "느타리", "팽이", "송이"]):
+        return ("포장 전체와 크기 균일도가 보이게 1장", "갓·자루·수분·변색이 보이게 근접 1장")
+    if any(k in t for k in ["배추", "브로콜리", "콜리플라워"]):
+        return ("포장 전체와 크기 분포가 보이게 1장", "대표 개체의 결구/꽃봉오리·상처·변색이 보이게 1장")
+    if any(k in t for k in ["깻잎", "시금치", "치커리", "샐러드"]):
+        return ("묶음/박스 전체가 보이게 1장", "잎끝·변색·짓무름·선도가 보이게 근접 1장")
+    if any(k in t for k in ["토마토", "딸기", "포도", "복숭아", "사과", "배", "감귤", "황금향"]):
+        return ("팩/상자 전체의 크기·색 균일도가 보이게 1장", "대표 과실의 색·숙도·상처·눌림이 보이게 근접 1장")
+
+    return ("포장/묶음 전체가 화면 70~80% 차게 1장", "대표 개체 여러 개의 상처·색·선도가 보이게 근접 1장")
+
+
+def _uploaded_file_info_v24(uploaded, default_name: str) -> Tuple[bytes, str, str]:
+    raw = uploaded.getvalue()
+    name = getattr(uploaded, "name", "") or default_name
+    content_type = getattr(uploaded, "type", "") or mimetypes.guess_type(name)[0] or "image/jpeg"
+    ext = Path(name).suffix.lower()
+    if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+        ext = ".jpg"
+    return raw, content_type, ext
+
+
+def render_quality_encyclopedia_v24():
+    st.title("📚 품위 백과사전")
+    st.caption(
+        "사진과 낙찰기록은 Supabase에 영구 저장합니다. "
+        "오늘 기준시세는 가락·강서 실제 경매자료에서 자동 계산합니다."
+    )
+
+    ok, msg = supabase_connection_test_v24()
+    if ok:
+        st.success("☁️ " + msg)
+    else:
+        st.error(msg)
+        st.caption(
+            "Streamlit Secrets에 SUPABASE_URL, SUPABASE_SECRET_KEY, "
+            "SUPABASE_BUCKET=quality-images가 들어있는지 확인하세요."
+        )
+        return
+
+    try:
+        records = supabase_list_records_v24(500)
+    except Exception as e:
+        st.error(f"백과사전 기록을 읽지 못했습니다: {e}")
+        return
+
+    tab_new, tab_library = st.tabs(["📷 새 품위 기록", "📚 백과사전 보기"])
+
+    with tab_new:
+        st.markdown("### 오늘 물건 기록")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            q_date = st.date_input("장일자", value=date.today(), key="q24_date")
+            q_item = st.text_input("품목", placeholder="예: 표고", key="q24_item").strip()
+            q_origin = st.text_input("산지", placeholder="예: 부여", key="q24_origin").strip()
+        with c2:
+            q_variety = st.text_input(
+                "품종표기 (선택)",
+                placeholder="예: 품목(품종)에 보이는 표기",
+                key="q24_variety",
+            ).strip()
+            q_unit = st.text_input("단위 (선택)", placeholder="예: 4kg", key="q24_unit").strip()
+            q_grade = st.text_input("등급 (선택)", placeholder="예: 특, 상", key="q24_grade").strip()
+
+        q_markets = st.multiselect(
+            "기준시세 시장",
+            ["가락", "강서"],
+            default=["가락", "강서"],
+            key="q24_markets",
+        )
+        q_quality = st.selectbox(
+            "내가 본 품위",
+            ["미판정", "A(좋음)", "B(보통)", "C(낮음)"],
+            key="q24_quality",
+        )
+
+        if q_item:
+            g1, g2 = shooting_guide_v24(q_item)
+            st.info(f"📸 **{q_item} 촬영 가이드**\n\n① {g1}\n\n② {g2}")
+
+        st.markdown("#### 사진 2장 권장")
+        p1, p2 = st.columns(2)
+        with p1:
+            overall_photo = st.camera_input("① 전체샷", key="q24_camera_overall")
+        with p2:
+            close_photo = st.camera_input("② 근접샷", key="q24_camera_close")
+
+        extra_photos = st.file_uploader(
+            "추가 사진 (선택)",
+            type=["jpg", "jpeg", "png", "webp"],
+            accept_multiple_files=True,
+            key="q24_extra_photos",
+        )
+
+        benchmark_key = (
+            f'q24_benchmark::{q_date.strftime("%Y%m%d")}::{q_item}::{q_origin}::'
+            f'{q_variety}::{q_unit}::{q_grade}::{"|".join(q_markets)}'
+        )
+
+        if st.button(
+            "📊 오늘 기준시세 자동 계산",
+            type="primary",
+            use_container_width=True,
+            key="q24_calc_benchmark",
+        ):
+            if not q_item:
+                st.error("품목을 입력해 주세요.")
+            elif not q_markets:
+                st.error("가락 또는 강서를 하나 이상 선택해 주세요.")
+            else:
+                with st.spinner("법인별 오늘 경락가를 확인 중..."):
+                    result = build_quality_benchmark_v24(
+                        q_date.strftime("%Y%m%d"),
+                        q_item,
+                        q_origin,
+                        tuple(q_markets),
+                        q_variety,
+                        q_unit,
+                        q_grade,
+                    )
+                st.session_state[benchmark_key] = result
+
+        benchmark_result = st.session_state.get(benchmark_key)
+
+        if isinstance(benchmark_result, dict):
+            if benchmark_result.get("ok"):
+                benchmark = int(benchmark_result["benchmark"])
+                st.success(
+                    f'오늘 기준시세 **{benchmark:,}원** · '
+                    f'{benchmark_result["company_count"]}법인 · '
+                    f'{benchmark_result["description"]}'
+                )
+                st.caption(
+                    f'법인별 중간가 범위 '
+                    f'{int(benchmark_result["company_middle_min"]):,} ~ '
+                    f'{int(benchmark_result["company_middle_max"]):,}원'
+                )
+
+                ref = quality_reference_v24(
+                    benchmark,
+                    records,
+                    q_item,
+                    q_origin,
+                    q_variety,
+                    q_unit,
+                    q_grade,
+                    q_quality,
+                )
+                if ref.get("ok"):
+                    st.info(
+                        f'과거 같은 조건·품위 {ref["count"]}건 기준으로 '
+                        f'오늘 참고가 **{ref["low"]:,} ~ {ref["high"]:,}원**, '
+                        f'중심 **{ref["center"]:,}원**'
+                    )
+                else:
+                    st.caption(
+                        f'같은 조건·품위의 완성 기록 {ref.get("count", 0)}건. '
+                        "3건 이상 쌓이면 오늘 시세에 과거 품위 프리미엄을 자동 반영합니다."
+                    )
+
+                with st.expander("기준시세에 사용한 법인"):
+                    bdf = pd.DataFrame(benchmark_result["companies"])
+                    st.dataframe(
+                        bdf.style.format({
+                            "건수": "{:,.0f}",
+                            "중간": "{:,.0f}",
+                            "머리": "{:,.0f}",
+                            "꼬리": "{:,.0f}",
+                            "평균": "{:,.0f}",
+                        }),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+            else:
+                st.warning(benchmark_result.get("message", "기준시세 계산 실패"))
+
+        e1, e2 = st.columns(2)
+        with e1:
+            expected_price = st.number_input(
+                "내 예상가 (선택)",
+                min_value=0,
+                step=1000,
+                value=0,
+                key="q24_expected",
+            )
+        with e2:
+            actual_price = st.number_input(
+                "실제 낙찰가 (경매 후)",
+                min_value=0,
+                step=1000,
+                value=0,
+                key="q24_actual",
+            )
+
+        memo = st.text_area(
+            "품위 메모",
+            placeholder="예: 갓 작고 균일 / 벌어짐 적음 / 상처 있음 / 선도 좋음",
+            key="q24_memo",
+        ).strip()
+
+        if st.button(
+            "☁️ Supabase에 영구 저장",
+            use_container_width=True,
+            key="q24_save",
+        ):
+            photos = []
+            if overall_photo is not None:
+                photos.append(("전체", overall_photo))
+            if close_photo is not None:
+                photos.append(("근접", close_photo))
+            for idx_extra, f in enumerate(extra_photos or [], start=1):
+                photos.append((f"추가{idx_extra}", f))
+
+            if not q_item:
+                st.error("품목을 입력해 주세요.")
+            elif not photos:
+                st.error("사진을 최소 1장 촬영하거나 선택해 주세요.")
+            elif not isinstance(benchmark_result, dict) or not benchmark_result.get("ok"):
+                st.error("먼저 오늘 기준시세를 자동 계산해 주세요.")
+            else:
+                record_id = str(uuid.uuid4())
+                benchmark = int(benchmark_result["benchmark"])
+                premium_pct = None
+                if actual_price and benchmark > 0:
+                    premium_pct = round(
+                        (float(actual_price) / benchmark - 1.0) * 100.0,
+                        2,
+                    )
+
+                record = {
+                    "id": record_id,
+                    "market_date": q_date.isoformat(),
+                    "item": q_item,
+                    "origin": q_origin or None,
+                    "variety": q_variety or None,
+                    "unit": q_unit or None,
+                    "grade": q_grade or None,
+                    "quality": q_quality,
+                    "markets": list(q_markets),
+                    "benchmark": benchmark,
+                    "benchmark_level": benchmark_result.get("level"),
+                    "benchmark_description": benchmark_result.get("description"),
+                    "benchmark_company_count": int(benchmark_result.get("company_count") or 0),
+                    "expected_price": int(expected_price or 0),
+                    "actual_price": int(actual_price or 0),
+                    "premium_pct": premium_pct,
+                    "memo": memo or None,
+                }
+
+                ok_rec, err_rec = supabase_insert_record_v24(record)
+                if not ok_rec:
+                    st.error(err_rec)
+                else:
+                    failed = []
+                    for sort_order, (ptype, uploaded) in enumerate(photos):
+                        raw, content_type, ext = _uploaded_file_info_v24(
+                            uploaded,
+                            f"{ptype}{sort_order}.jpg",
+                        )
+                        storage_path = (
+                            f'{q_item}/{q_date.strftime("%Y%m%d")}/'
+                            f'{record_id}/{sort_order:02d}_{ptype}{ext}'
+                        )
+                        ok_up, err_up = supabase_upload_photo_v24(
+                            storage_path,
+                            raw,
+                            content_type,
+                        )
+                        if not ok_up:
+                            failed.append(err_up)
+                            continue
+
+                        ok_meta, err_meta = supabase_insert_photo_row_v24({
+                            "record_id": record_id,
+                            "storage_path": storage_path,
+                            "photo_type": ptype,
+                            "sort_order": sort_order,
+                        })
+                        if not ok_meta:
+                            failed.append(err_meta)
+
+                    supabase_list_records_v24.clear()
+                    supabase_list_photos_v24.clear()
+                    supabase_fetch_photo_v24.clear()
+
+                    if failed:
+                        st.warning(
+                            "기록은 저장됐지만 일부 사진 처리에 실패했습니다.\n\n"
+                            + "\n".join(f"- {x}" for x in failed[:5])
+                        )
+                    else:
+                        st.success("✅ 품위 기록과 사진을 Supabase에 영구 저장했습니다.")
+                    st.rerun()
+
+    with tab_library:
+        st.markdown("### 저장된 품위 백과사전")
+
+        if not records:
+            st.info("아직 저장된 품위 기록이 없습니다.")
+            return
+
+        item_options = sorted({
+            _v24_text(r.get("item"))
+            for r in records
+            if _v24_text(r.get("item"))
+        })
+        filter_item = st.selectbox(
+            "품목 필터",
+            ["전체"] + item_options,
+            key="q24_library_item",
+        )
+
+        origin_options = sorted({
+            _v24_text(r.get("origin"))
+            for r in records
+            if _v24_text(r.get("origin"))
+            and (filter_item == "전체" or _v24_text(r.get("item")) == filter_item)
+        })
+        filter_origin = st.selectbox(
+            "산지 필터",
+            ["전체"] + origin_options,
+            key="q24_library_origin",
+        )
+
+        filtered = []
+        for r in records:
+            if filter_item != "전체" and _v24_text(r.get("item")) != filter_item:
+                continue
+            if filter_origin != "전체" and _v24_text(r.get("origin")) != filter_origin:
+                continue
+            filtered.append(r)
+
+        st.caption(f"기록 {len(filtered):,}건")
+
+        # 최신순
+        for r in filtered[:100]:
+            title = (
+                f'{r.get("market_date", "")} · {r.get("item", "")}'
+                + (f' · {r.get("origin")}' if r.get("origin") else "")
+                + (f' · {r.get("unit")}' if r.get("unit") else "")
+                + f' · {r.get("quality") or "미판정"}'
+            )
+
+            with st.expander(title, expanded=False):
+                try:
+                    photos = supabase_list_photos_v24(str(r["id"]))
+                except Exception as e:
+                    photos = []
+                    st.caption(f"사진 목록 오류: {e}")
+
+                if photos:
+                    cols = st.columns(min(2, len(photos)))
+                    for idxp, p in enumerate(photos[:6]):
+                        try:
+                            raw = supabase_fetch_photo_v24(str(p["storage_path"]))
+                            with cols[idxp % len(cols)]:
+                                st.image(
+                                    raw,
+                                    caption=str(p.get("photo_type") or "사진"),
+                                    use_container_width=True,
+                                )
+                        except Exception as e:
+                            st.caption(f"사진 불러오기 실패: {e}")
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("당시 기준시세", f'{int(r.get("benchmark") or 0):,}원')
+                m2.metric("실제 낙찰가", f'{int(r.get("actual_price") or 0):,}원')
+                prem = r.get("premium_pct")
+                m3.metric(
+                    "시세 대비",
+                    "미입력" if prem is None else f'{float(prem):+.1f}%',
+                )
+
+                st.caption(
+                    f'품종 {r.get("variety") or "—"} · '
+                    f'등급 {r.get("grade") or "—"} · '
+                    f'기준 {r.get("benchmark_description") or "—"}'
+                )
+
+                if r.get("memo"):
+                    st.write(r["memo"])
+
+                if not int(r.get("actual_price") or 0):
+                    later_price = st.number_input(
+                        "실제 낙찰가 나중에 입력",
+                        min_value=0,
+                        step=1000,
+                        value=0,
+                        key=f'q24_later_price::{r["id"]}',
+                    )
+                    if st.button(
+                        "낙찰가 반영",
+                        use_container_width=True,
+                        key=f'q24_later_btn::{r["id"]}',
+                    ):
+                        benchmark = int(r.get("benchmark") or 0)
+                        if later_price <= 0:
+                            st.warning("실제 낙찰가를 입력해 주세요.")
+                        elif benchmark <= 0:
+                            st.error("이 기록에 기준시세가 없어 보정률을 계산할 수 없습니다.")
+                        else:
+                            premium = (
+                                float(later_price) / benchmark - 1.0
+                            ) * 100.0
+                            ok_upd, err_upd = supabase_update_actual_price_v24(
+                                str(r["id"]),
+                                int(later_price),
+                                premium,
+                            )
+                            if ok_upd:
+                                st.success("실제 낙찰가를 반영했습니다.")
+                                st.rerun()
+                            else:
+                                st.error(err_upd)
+
+
 # =========================================================
 # UI
 # =========================================================
-mode_options = ["📊 경매조회", "🧩 등외 해체", "🔍 세부규격 찾기"]
+mode_options = ["📊 경매조회", "⭐ 즐겨찾기", "📚 품위 백과사전", "🧩 등외 해체", "🔍 세부규격 찾기"]
 mode = st.selectbox(
     "메뉴",
     mode_options,
@@ -3903,6 +5685,29 @@ mode = st.selectbox(
     key="top_mode_v18",
     help="모바일에서 메뉴가 가려지지 않도록 드롭다운 방식으로 바꿨습니다.",
 )
+
+if mode == "📚 품위 백과사전":
+    render_quality_encyclopedia_v24()
+    st.stop()
+
+if mode == "⭐ 즐겨찾기":
+    st.title("⭐ 즐겨찾기")
+    fav_date = st.date_input("장일자", value=date.today(), key="v24_fav_date")
+    fav_markets = st.multiselect(
+        "시장",
+        ["가락", "강서"],
+        default=["가락", "강서"],
+        key="v24_fav_markets",
+    )
+    if not fav_markets:
+        st.warning("가락 또는 강서를 선택해 주세요.")
+    else:
+        render_favorites_v22(
+            fav_date.strftime("%Y%m%d"),
+            tuple(fav_markets),
+            "",
+        )
+    st.stop()
 
 if mode == "🧩 등외 해체":
     render_grade_decoder()
@@ -3913,10 +5718,11 @@ if mode == "🔍 세부규격 찾기":
     st.stop()
 
 st.title("가락·강서 경매조회")
-st.caption("✅ APP VERSION: v20-FAVORITES-DIRECT-MATCH")
-st.caption("즐겨찾기도 직접 품목검색과 동일한 법인별 조회 방식으로 확인")
+st.caption("✅ APP VERSION: v24-SUPABASE-QUALITY-ENCYCLOPEDIA")
+st.caption("⭐ 품목+산지 즐겨찾기 · 📚 Supabase 영구저장 품위 백과사전")
 
 default_item = qp_get("item", "")
+default_origin = qp_get("origin", "")
 default_date = parse_default_date(qp_get("date", ""))
 
 market_param = qp_get("markets", "가락,강서")
@@ -3924,16 +5730,23 @@ default_markets = [x for x in market_param.split(",") if x in MARKETS]
 if not default_markets:
     default_markets = ["가락", "강서"]
 
-c1, c2 = st.columns([1, 1.35])
+c1, c2, c3 = st.columns([1, 1.15, 1.15])
 with c1:
     selected_date = st.date_input("장일자", value=default_date)
-    st.caption("예: 10월 1일 장 = 9월 30일 밤부터 10월 1일 새벽까지의 장")
 with c2:
     item_text = st.text_input(
         "품목",
         value=default_item,
-        placeholder="예: 표고, 당근, 쪽파",
+        placeholder="예: 표고, 당근",
     ).strip()
+with c3:
+    origin_text = st.text_input(
+        "산지 (선택)",
+        value=default_origin,
+        placeholder="예: 부여, 청도, 밀양",
+        help="공개 경매결과의 출하지에서 부분일치로 찾습니다.",
+    ).strip()
+st.caption("장일자 기준 · 산지는 비워두면 전체, 입력하면 `출하지` 부분일치")
 
 market_scope = st.multiselect(
     "시장",
@@ -3984,9 +5797,10 @@ if search_clicked:
         st.session_state.pop("favorites_request_v18", None)
         st.session_state["favorites_request_v19"] = {
             "date": ymd,
+            "origin": origin_text,
             "markets": tuple(market_scope),
         }
-        qp_set(date=ymd, item="", markets=",".join(market_scope))
+        qp_set(date=ymd, item="", origin=origin_text, markets=",".join(market_scope))
     else:
         st.session_state.pop("favorites_request_v19", None)
         st.session_state.pop("favorites_request_v18", None)
@@ -3994,16 +5808,18 @@ if search_clicked:
         st.session_state["search"] = {
             "date": ymd,
             "item": item_text,
+            "origin": origin_text,
             "markets": tuple(market_scope),
         }
-        qp_set(date=ymd, item=item_text, markets=",".join(market_scope))
+        qp_set(date=ymd, item=item_text, origin=origin_text, markets=",".join(market_scope))
 
 # 품목을 비워 검색한 경우: 즐겨찾기 추가와 조회를 분리
 if "favorites_request_v19" in st.session_state:
     fav_req = st.session_state["favorites_request_v19"]
-    render_favorites_v20(
+    render_favorites_v22(
         fav_req["date"],
         tuple(fav_req["markets"]),
+        str(fav_req.get("origin", "")),
     )
 
     if "item_picker_request_v16" not in st.session_state:
@@ -4023,6 +5839,7 @@ if "search" not in st.session_state and default_item:
     st.session_state["search"] = {
         "date": default_date.strftime("%Y%m%d"),
         "item": default_item,
+        "origin": default_origin,
         "markets": tuple(default_markets),
     }
 
@@ -4051,18 +5868,22 @@ if reload_clicked:
     fetch_all_company_rows.clear()
     st.rerun()
 
+origin_label = str(search.get("origin", "")).strip()
 st.caption(
     f'{search["date"][:4]}-{search["date"][4:6]}-{search["date"][6:8]} · '
-    f'{search["item"]} · {" + ".join(search["markets"])}'
+    f'{search["item"]}'
+    + (f' · 산지 {origin_label}' if origin_label else '')
+    + f' · {" + ".join(search["markets"])}'
 )
 st.caption("✅ 결과 있음 · ⏳ 아직 없음 · 우측 **재로딩**으로 다시 확인")
 
 try:
     with st.spinner("법인별 경매결과 확인 중..."):
-        companies = discover_company_status(
+        companies = discover_company_status_v21(
             search["date"],
             search["item"],
             tuple(search["markets"]),
+            str(search.get("origin", "")),
         )
 except Exception as e:
     st.error("가락시장 경매 사이트에 연결하지 못했습니다.")
@@ -4093,7 +5914,7 @@ for market_name in search["markets"]:
 # - ⏳ = 아직 결과 없음 + 누를 수 없음
 # - 여러 법인을 동시에 선택 가능
 selection_state_key = (
-    f'corp_selected::{search["date"]}::{search["item"]}::'
+    f'corp_selected::{search["date"]}::{search["item"]}::{search.get("origin", "")}::'
     + ",".join(search["markets"])
 )
 if selection_state_key not in st.session_state:
@@ -4134,7 +5955,7 @@ for market_name in search["markets"]:
         with cols[idx % 2]:
             clicked = st.button(
                 label,
-                key=f'corp_btn::{search["date"]}::{search["item"]}::{c["key"]}',
+                key=f'corp_btn::{search["date"]}::{search["item"]}::{search.get("origin", "")}::{c["key"]}',
                 disabled=not c["available"],
                 type=btn_type,
                 use_container_width=True,
@@ -4182,13 +6003,23 @@ if len(selected_labels) >= 2:
             df_cmp = fetch_all_company_rows(
                 search["date"], search["item"], c["market"], c["code"]
             )
+            df_cmp = filter_origin_v21(df_cmp, str(search.get("origin", "")))
             if not df_cmp.empty:
                 df_cmp = df_cmp.copy()
                 df_cmp.insert(1, "법인", c["name"])
                 compare_frames.append(df_cmp)
 
     try:
-        render_compare_v14(compare_frames, selected_labels, search["item"])
+        current_origin = str(search.get("origin", "")).strip()
+        if current_origin:
+            render_origin_variety_compare_v22(
+                compare_frames,
+                selected_labels,
+                search["item"],
+                current_origin,
+            )
+        else:
+            render_compare_v14(compare_frames, selected_labels, search["item"])
     except Exception as e:
         st.error("법인 비교표 표시 중 오류가 발생했습니다.")
         st.code(str(e))
@@ -4200,6 +6031,7 @@ if len(selected_labels) >= 2:
             selected_labels,
             search["date"],
             search["item"],
+            str(search.get("origin", "")),
         )
     except Exception as e:
         st.error("약세 진단 표시 중 오류가 발생했습니다.")
@@ -4211,7 +6043,7 @@ selected_frames: List[pd.DataFrame] = []
 
 if len(selected_labels) == 1:
     company = label_to_company[selected_labels[0]]
-    frame = safe_render_company_v19(company, search["date"], search["item"])
+    frame = safe_render_company_v21(company, search["date"], search["item"], str(search.get("origin", "")))
     if not frame.empty:
         selected_frames.append(frame)
 else:
@@ -4219,7 +6051,7 @@ else:
     for tab, label in zip(tabs, selected_labels):
         with tab:
             company = label_to_company[label]
-            frame = safe_render_company_v19(company, search["date"], search["item"])
+            frame = safe_render_company_v21(company, search["date"], search["item"], str(search.get("origin", "")))
             if not frame.empty:
                 selected_frames.append(frame)
 
