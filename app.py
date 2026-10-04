@@ -5014,6 +5014,144 @@ def supabase_update_actual_price_v24(
         return False, f"낙찰가 업데이트 오류: {e}"
 
 
+
+def supabase_update_record_v33(
+    record_id: str,
+    patch: Dict[str, object],
+) -> Tuple[bool, str]:
+    """백과사전 기록의 일반 필드를 수정한다."""
+    url, _, _ = _supabase_config_v24()
+    try:
+        r = requests.patch(
+            f"{url}/rest/v1/quality_records",
+            headers=_supabase_headers_v24({
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal",
+            }),
+            params={"id": f"eq.{record_id}"},
+            json=patch,
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            return False, f"기록 수정 실패: HTTP {r.status_code} · {r.text[:500]}"
+
+        try:
+            supabase_list_records_v24.clear()
+        except Exception:
+            pass
+        return True, ""
+    except Exception as e:
+        return False, f"기록 수정 오류: {e}"
+
+
+def supabase_delete_storage_object_v33(storage_path: str) -> Tuple[bool, str]:
+    """Supabase Storage의 실제 사진 파일을 삭제한다."""
+    url, _, bucket = _supabase_config_v24()
+    safe_path = "/".join(quote(x, safe="") for x in str(storage_path).split("/"))
+    try:
+        r = requests.delete(
+            f"{url}/storage/v1/object/{quote(bucket, safe='')}/{safe_path}",
+            headers=_supabase_headers_v24(),
+            timeout=30,
+        )
+        # 이미 없는 파일은 삭제 완료로 본다.
+        if r.status_code >= 400 and r.status_code != 404:
+            return False, f"사진 삭제 실패: HTTP {r.status_code} · {r.text[:400]}"
+        return True, ""
+    except Exception as e:
+        return False, f"사진 삭제 오류: {e}"
+
+
+def supabase_delete_record_v33(record_id: str) -> Tuple[bool, str]:
+    """
+    사진 Storage 객체를 먼저 지우고 quality_records를 삭제한다.
+    quality_photos 메타행은 FK ON DELETE CASCADE로 함께 삭제된다.
+    """
+    url, _, _ = _supabase_config_v24()
+
+    try:
+        photos = supabase_list_photos_v24(str(record_id))
+    except Exception as e:
+        return False, f"삭제 전 사진 목록 확인 실패: {e}"
+
+    photo_errors = []
+    for p in photos:
+        storage_path = str(p.get("storage_path") or "").strip()
+        if not storage_path:
+            continue
+        ok_photo, err_photo = supabase_delete_storage_object_v33(storage_path)
+        if not ok_photo:
+            photo_errors.append(err_photo)
+
+    if photo_errors:
+        return False, " / ".join(photo_errors[:3])
+
+    try:
+        r = requests.delete(
+            f"{url}/rest/v1/quality_records",
+            headers=_supabase_headers_v24({
+                "Prefer": "return=minimal",
+            }),
+            params={"id": f"eq.{record_id}"},
+            timeout=30,
+        )
+        if r.status_code >= 400:
+            return False, f"기록 삭제 실패: HTTP {r.status_code} · {r.text[:500]}"
+
+        for fn in (
+            supabase_list_records_v24,
+            supabase_list_photos_v24,
+            supabase_fetch_photo_v24,
+        ):
+            try:
+                fn.clear()
+            except Exception:
+                pass
+
+        return True, ""
+    except Exception as e:
+        return False, f"기록 삭제 오류: {e}"
+
+
+def _quality_parts_v33(label: str) -> Tuple[str, int]:
+    """특2 -> ('특', 2), 기존 A/B/C 등은 미판정."""
+    s = _v24_text(label)
+    m = re.fullmatch(r"(특|상|중)([1-5])", s)
+    if not m:
+        return "미판정", 3
+    return m.group(1), int(m.group(2))
+
+
+def _clean_user_memo_v33(memo: str) -> str:
+    """
+    v31+에서 자동으로 붙인 메타 라인을 제외해 사용자가 직접 쓴 메모만 편집한다.
+    """
+    lines = []
+    for line in str(memo or "").splitlines():
+        t = line.strip()
+        if not t:
+            continue
+        if (
+            t.startswith("[품위]")
+            or t.startswith("[기준]")
+            or t.startswith("[공식등급별 대비]")
+            or t.startswith("[원산지·사용자입력]")
+        ):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _origin_country_from_memo_v33(memo: str) -> str:
+    for line in str(memo or "").splitlines():
+        t = line.strip()
+        if t.startswith("[원산지·사용자입력]"):
+            value = t.split("]", 1)[-1].strip()
+            return value or "미확인"
+    return "미확인"
+
+
+
 def _quality_filter_v24(
     df: pd.DataFrame,
     origin: str = "",
@@ -6218,6 +6356,7 @@ def render_quality_encyclopedia_v24():
 
         # 최신순
         for r in filtered[:100]:
+            record_id = str(r["id"])
             title = (
                 f'{r.get("market_date", "")} · {r.get("item", "")}'
                 + (f' · {r.get("origin")}' if r.get("origin") else "")
@@ -6227,7 +6366,7 @@ def render_quality_encyclopedia_v24():
 
             with st.expander(title, expanded=False):
                 try:
-                    photos = supabase_list_photos_v24(str(r["id"]))
+                    photos = supabase_list_photos_v24(record_id)
                 except Exception as e:
                     photos = []
                     st.caption(f"사진 목록 오류: {e}")
@@ -6250,6 +6389,7 @@ def render_quality_encyclopedia_v24():
                 is_garak_head_record = (
                     "가락 머리" in _v24_text(r.get("benchmark_description"))
                     or _v24_text(r.get("benchmark_level")).startswith("G")
+                    or "가락 전체 동일단위 머리" in _v24_text(r.get("benchmark_description"))
                 )
                 m1.metric(
                     "당시 가락 머리" if is_garak_head_record else "당시 기준시세",
@@ -6282,18 +6422,21 @@ def render_quality_encyclopedia_v24():
                 if r.get("memo"):
                     st.write(r["memo"])
 
+                # -------------------------------------------------
+                # 실제 낙찰가 빠른 입력(기존 기능)
+                # -------------------------------------------------
                 if not int(r.get("actual_price") or 0):
                     later_price = st.number_input(
                         "실제 낙찰가 나중에 입력",
                         min_value=0,
                         step=1000,
                         value=0,
-                        key=f'q24_later_price::{r["id"]}',
+                        key=f'q24_later_price::{record_id}',
                     )
                     if st.button(
                         "낙찰가 반영",
                         use_container_width=True,
-                        key=f'q24_later_btn::{r["id"]}',
+                        key=f'q24_later_btn::{record_id}',
                     ):
                         benchmark = int(r.get("benchmark") or 0)
                         if later_price <= 0:
@@ -6305,7 +6448,7 @@ def render_quality_encyclopedia_v24():
                                 float(later_price) / benchmark - 1.0
                             ) * 100.0
                             ok_upd, err_upd = supabase_update_actual_price_v24(
-                                str(r["id"]),
+                                record_id,
                                 int(later_price),
                                 premium,
                             )
@@ -6314,6 +6457,296 @@ def render_quality_encyclopedia_v24():
                                 st.rerun()
                             else:
                                 st.error(err_upd)
+
+                st.divider()
+
+                # -------------------------------------------------
+                # v33: 수정 / 삭제
+                # -------------------------------------------------
+                edit_col, delete_col = st.columns(2)
+                with edit_col:
+                    if st.button(
+                        "✏️ 기록 수정",
+                        use_container_width=True,
+                        key=f"q33_edit_btn::{record_id}",
+                    ):
+                        st.session_state["q33_edit_record_id"] = record_id
+                        st.session_state.pop("q33_delete_record_id", None)
+                        st.rerun()
+
+                with delete_col:
+                    if st.button(
+                        "🗑️ 기록 삭제",
+                        use_container_width=True,
+                        key=f"q33_delete_btn::{record_id}",
+                    ):
+                        st.session_state["q33_delete_record_id"] = record_id
+                        st.session_state.pop("q33_edit_record_id", None)
+                        st.rerun()
+
+                # ---------------------------
+                # 수정 폼
+                # ---------------------------
+                if st.session_state.get("q33_edit_record_id") == record_id:
+                    st.markdown("#### ✏️ 기록 수정")
+
+                    try:
+                        old_date = pd.to_datetime(
+                            str(r.get("market_date") or date.today())
+                        ).date()
+                    except Exception:
+                        old_date = date.today()
+
+                    old_quality_main, old_quality_sub = _quality_parts_v33(
+                        str(r.get("quality") or "")
+                    )
+                    old_origin_country = _origin_country_from_memo_v33(
+                        str(r.get("memo") or "")
+                    )
+                    origin_country_options = ["미확인", "국산", "중국산", "기타"]
+                    if old_origin_country in origin_country_options:
+                        old_origin_country_choice = old_origin_country
+                        old_origin_country_other = ""
+                    else:
+                        old_origin_country_choice = "기타"
+                        old_origin_country_other = old_origin_country
+
+                    ec1, ec2 = st.columns(2)
+                    with ec1:
+                        edit_date = st.date_input(
+                            "장일자",
+                            value=old_date,
+                            key=f"q33_edit_date::{record_id}",
+                        )
+                        edit_item = st.text_input(
+                            "품목",
+                            value=str(r.get("item") or ""),
+                            key=f"q33_edit_item::{record_id}",
+                        ).strip()
+                        edit_origin = st.text_input(
+                            "출하지",
+                            value=str(r.get("origin") or ""),
+                            key=f"q33_edit_origin::{record_id}",
+                        ).strip()
+                        edit_variety = st.text_input(
+                            "품종표기",
+                            value=str(r.get("variety") or ""),
+                            key=f"q33_edit_variety::{record_id}",
+                        ).strip()
+                    with ec2:
+                        edit_unit = st.text_input(
+                            "단위/포장",
+                            value=str(r.get("unit") or ""),
+                            key=f"q33_edit_unit::{record_id}",
+                        ).strip()
+                        edit_grade = st.text_input(
+                            "공식 등급표기",
+                            value=str(r.get("grade") or ""),
+                            key=f"q33_edit_grade::{record_id}",
+                        ).strip()
+                        edit_actual = st.number_input(
+                            "실제 낙찰가",
+                            min_value=0,
+                            step=1000,
+                            value=int(r.get("actual_price") or 0),
+                            key=f"q33_edit_actual::{record_id}",
+                        )
+                        edit_origin_country_choice = st.selectbox(
+                            "원산지 (참고)",
+                            origin_country_options,
+                            index=origin_country_options.index(old_origin_country_choice),
+                            key=f"q33_edit_origin_country::{record_id}",
+                        )
+
+                    edit_origin_country_other = ""
+                    if edit_origin_country_choice == "기타":
+                        edit_origin_country_other = st.text_input(
+                            "원산지 직접 입력",
+                            value=old_origin_country_other,
+                            key=f"q33_edit_origin_country_other::{record_id}",
+                        ).strip()
+
+                    edit_quality_main = st.selectbox(
+                        "큰 등급",
+                        ["미판정", "특", "상", "중"],
+                        index=["미판정", "특", "상", "중"].index(old_quality_main),
+                        key=f"q33_edit_quality_main::{record_id}",
+                    )
+                    if edit_quality_main == "미판정":
+                        edit_quality_sub = 3
+                        edit_quality = "미판정"
+                    else:
+                        edit_quality_sub = st.radio(
+                            "세부 등급",
+                            [1, 2, 3, 4, 5],
+                            index=max(0, min(4, old_quality_sub - 1)),
+                            horizontal=True,
+                            key=f"q33_edit_quality_sub::{record_id}",
+                        )
+                        edit_quality = quality_label_v31(
+                            edit_quality_main,
+                            edit_quality_sub,
+                        )
+                        st.caption(f"수정 후 품위: **{edit_quality}**")
+
+                    edit_user_memo = st.text_area(
+                        "메모",
+                        value=_clean_user_memo_v33(str(r.get("memo") or "")),
+                        key=f"q33_edit_memo::{record_id}",
+                    )
+
+                    key_fields_changed = any([
+                        edit_date.isoformat() != str(r.get("market_date") or ""),
+                        edit_item != str(r.get("item") or ""),
+                        edit_variety != str(r.get("variety") or ""),
+                        edit_unit != str(r.get("unit") or ""),
+                    ])
+                    if key_fields_changed:
+                        st.warning(
+                            "장일자·품목·품종·단위를 바꾸면 저장할 때 "
+                            "가락 동일단위 전체 머리도 다시 계산합니다."
+                        )
+
+                    save_col, cancel_col = st.columns(2)
+                    with save_col:
+                        if st.button(
+                            "💾 수정 저장",
+                            type="primary",
+                            use_container_width=True,
+                            key=f"q33_save_edit::{record_id}",
+                        ):
+                            if not edit_item:
+                                st.error("품목은 비울 수 없습니다.")
+                            elif not edit_unit:
+                                st.error("단위/포장은 비울 수 없습니다.")
+                            else:
+                                new_benchmark = int(r.get("benchmark") or 0)
+                                new_level = str(r.get("benchmark_level") or "")
+                                new_desc = str(r.get("benchmark_description") or "")
+                                new_company_count = int(r.get("benchmark_company_count") or 0)
+
+                                if key_fields_changed:
+                                    with st.spinner("수정된 조건으로 가락 머리를 다시 계산 중..."):
+                                        recalc = build_garak_head_v31(
+                                            edit_date.strftime("%Y%m%d"),
+                                            edit_item,
+                                            edit_variety,
+                                            edit_unit,
+                                            "",
+                                        )
+                                    if not recalc.get("ok"):
+                                        st.error(
+                                            "수정된 조건의 가락 동일단위 머리를 찾지 못해 "
+                                            "저장하지 않았습니다. "
+                                            + str(recalc.get("message") or "")
+                                        )
+                                        st.stop()
+
+                                    new_benchmark = int(recalc["benchmark"])
+                                    new_level = str(recalc.get("level") or "")
+                                    new_desc = "가락 전체 동일단위 머리 · 전체등급"
+                                    new_company_count = int(recalc.get("company_count") or 0)
+
+                                new_premium = None
+                                if int(edit_actual or 0) > 0 and new_benchmark > 0:
+                                    new_premium = round(
+                                        (float(edit_actual) / new_benchmark - 1.0) * 100.0,
+                                        2,
+                                    )
+
+                                edited_origin_country = (
+                                    edit_origin_country_other
+                                    if edit_origin_country_choice == "기타"
+                                    else edit_origin_country_choice
+                                )
+
+                                memo_parts = []
+                                if edit_user_memo.strip():
+                                    memo_parts.append(edit_user_memo.strip())
+                                if edited_origin_country and edited_origin_country != "미확인":
+                                    memo_parts.append(
+                                        f"[원산지·사용자입력] {edited_origin_country}"
+                                    )
+                                memo_parts.append(f"[품위] {edit_quality}")
+                                memo_parts.append("[기준] 가락 같은 단위 전체등급 머리 대비")
+
+                                patch = {
+                                    "market_date": edit_date.isoformat(),
+                                    "item": edit_item,
+                                    "origin": edit_origin or None,
+                                    "variety": edit_variety or None,
+                                    "unit": edit_unit or None,
+                                    "grade": edit_grade or None,
+                                    "quality": edit_quality,
+                                    "benchmark": new_benchmark,
+                                    "benchmark_level": new_level or None,
+                                    "benchmark_description": new_desc or None,
+                                    "benchmark_company_count": new_company_count,
+                                    "actual_price": int(edit_actual or 0) or None,
+                                    "premium_pct": new_premium,
+                                    "memo": "\n".join(memo_parts),
+                                }
+
+                                ok_edit, err_edit = supabase_update_record_v33(
+                                    record_id,
+                                    patch,
+                                )
+                                if ok_edit:
+                                    st.session_state.pop("q33_edit_record_id", None)
+                                    st.success("기록을 수정했습니다.")
+                                    st.rerun()
+                                else:
+                                    st.error(err_edit)
+
+                    with cancel_col:
+                        if st.button(
+                            "취소",
+                            use_container_width=True,
+                            key=f"q33_cancel_edit::{record_id}",
+                        ):
+                            st.session_state.pop("q33_edit_record_id", None)
+                            st.rerun()
+
+                # ---------------------------
+                # 삭제 확인
+                # ---------------------------
+                if st.session_state.get("q33_delete_record_id") == record_id:
+                    st.error(
+                        "이 기록을 삭제하면 백과사전 기록과 연결된 사진도 "
+                        "Supabase에서 삭제됩니다."
+                    )
+                    confirm_delete = st.checkbox(
+                        "정말 삭제합니다",
+                        key=f"q33_confirm_delete::{record_id}",
+                    )
+
+                    dc1, dc2 = st.columns(2)
+                    with dc1:
+                        if st.button(
+                            "❌ 영구 삭제",
+                            type="primary",
+                            use_container_width=True,
+                            disabled=not confirm_delete,
+                            key=f"q33_confirm_delete_btn::{record_id}",
+                        ):
+                            with st.spinner("기록과 사진을 삭제 중..."):
+                                ok_del, err_del = supabase_delete_record_v33(record_id)
+
+                            if ok_del:
+                                st.session_state.pop("q33_delete_record_id", None)
+                                st.success("기록과 사진을 삭제했습니다.")
+                                st.rerun()
+                            else:
+                                st.error(err_del)
+
+                    with dc2:
+                        if st.button(
+                            "삭제 취소",
+                            use_container_width=True,
+                            key=f"q33_cancel_delete::{record_id}",
+                        ):
+                            st.session_state.pop("q33_delete_record_id", None)
+                            st.rerun()
 
 
 # =========================================================
@@ -6360,8 +6793,8 @@ if mode == "🔍 세부규격 찾기":
     st.stop()
 
 st.title("가락·강서 경매조회")
-st.caption("✅ APP VERSION: v32-EXPLICIT-GRADE-HEADS")
-st.caption("⭐ 특/상/중 1~5 품위 · 📊 전체/특/상/중 머리 대비를 각각 표시")
+st.caption("✅ APP VERSION: v33-ENCYCLOPEDIA-EDIT-DELETE")
+st.caption("⭐ 특/상/중 1~5 품위 · ✏️ 백과사전 수정 · 🗑️ 기록/사진 삭제")
 
 default_item = qp_get("item", "")
 default_origin = qp_get("origin", "")
