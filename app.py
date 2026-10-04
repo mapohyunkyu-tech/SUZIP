@@ -9,6 +9,7 @@ import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from statistics import mean
+from pathlib import Path
 from typing import Dict, List, Tuple
 from urllib.parse import urljoin, urlparse, quote, unquote
 
@@ -5364,31 +5365,47 @@ def render_quality_encyclopedia_v24():
 
         st.markdown("#### 사진 2장 권장")
         st.caption(
-            "모바일 브라우저는 카메라 2개를 동시에 열면 한쪽이 막힐 수 있어서 "
-            "**카메라 하나로 전체샷 → 근접샷 순서대로 저장**하게 바꿨습니다."
+            "전체샷/근접샷은 **지금 촬영**하거나 **이미 찍어둔 사진을 갤러리에서 선택**할 수 있습니다. "
+            "휴대폰에서는 카메라 한 개만 열도록 유지합니다."
         )
 
         capture_mode = st.radio(
-            "촬영할 사진",
+            "사진 종류",
             ["① 전체샷", "② 근접샷"],
             horizontal=True,
-            key="q25_capture_mode",
+            key="q27_capture_mode",
+        )
+        active_slot = "overall" if capture_mode.startswith("①") else "close"
+
+        source_mode = st.radio(
+            "사진 가져오기",
+            ["📷 지금 촬영", "🖼️ 앨범에서 선택"],
+            horizontal=True,
+            key=f"q27_source_mode::{active_slot}",
         )
 
-        active_slot = "overall" if capture_mode.startswith("①") else "close"
-        camera_photo = st.camera_input(
-            "📷 촬영",
-            key=f"q25_camera::{active_slot}",
-        )
+        selected_photo = None
+        if source_mode.startswith("📷"):
+            selected_photo = st.camera_input(
+                f"{capture_mode} 촬영",
+                key=f"q27_camera::{active_slot}",
+            )
+        else:
+            selected_photo = st.file_uploader(
+                f"{capture_mode} 사진 선택",
+                type=["jpg", "jpeg", "png", "webp"],
+                accept_multiple_files=False,
+                key=f"q27_upload::{active_slot}",
+            )
 
         save_col, clear_col = st.columns(2)
         with save_col:
             if st.button(
                 f"💾 {capture_mode} 저장",
                 use_container_width=True,
-                key=f"q25_save_capture::{active_slot}",
+                key=f"q27_save_capture::{active_slot}",
             ):
-                ok_cap, msg_cap = _save_camera_capture_v25(camera_photo, active_slot)
+                ok_cap, msg_cap = _save_camera_capture_v25(selected_photo, active_slot)
                 if ok_cap:
                     st.success(f"{capture_mode} 저장됨")
                     st.rerun()
@@ -5398,10 +5415,10 @@ def render_quality_encyclopedia_v24():
         with clear_col:
             saved_now = st.session_state.get(f"q25_saved_{active_slot}")
             if st.button(
-                f"↩ {capture_mode} 다시 찍기",
+                f"↩ {capture_mode} 바꾸기",
                 use_container_width=True,
                 disabled=saved_now is None,
-                key=f"q25_clear_capture::{active_slot}",
+                key=f"q27_clear_capture::{active_slot}",
             ):
                 _clear_camera_capture_v25(active_slot)
                 st.rerun()
@@ -5415,19 +5432,19 @@ def render_quality_encyclopedia_v24():
                 st.success("✅ 전체샷 저장됨")
                 st.image(saved_overall["raw"], use_container_width=True)
             else:
-                st.info("① 전체샷 미촬영")
+                st.info("① 전체샷 미등록")
         with status_cols[1]:
             if saved_close:
                 st.success("✅ 근접샷 저장됨")
                 st.image(saved_close["raw"], use_container_width=True)
             else:
-                st.info("② 근접샷 미촬영")
+                st.info("② 근접샷 미등록")
 
         extra_photos = st.file_uploader(
             "추가 사진 (선택)",
             type=["jpg", "jpeg", "png", "webp"],
             accept_multiple_files=True,
-            key="q25_extra_photos",
+            key="q27_extra_photos",
         )
 
         benchmark_key = (
@@ -5804,8 +5821,8 @@ if mode == "🔍 세부규격 찾기":
     st.stop()
 
 st.title("가락·강서 경매조회")
-st.caption("✅ APP VERSION: v25-SINGLE-CAMERA-CAPTURE")
-st.caption("⭐ 품목+산지 즐겨찾기 · 📚 품위 백과사전 · 📷 모바일 단일카메라 순차촬영")
+st.caption("✅ APP VERSION: v27-CAMERA-OR-GALLERY")
+st.caption("⭐ 품목+산지 즐겨찾기 · 📚 품위 백과사전 · 📷 촬영/앨범 둘 다 지원")
 
 default_item = qp_get("item", "")
 default_origin = qp_get("origin", "")
