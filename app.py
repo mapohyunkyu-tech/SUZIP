@@ -466,6 +466,9 @@ def render_company(company: Dict[str, str], date_yyyymmdd: str, item: str) -> pd
     m2.metric("품종표기", f'{df["품목(품종)"].nunique():,}개')
     m3.metric("가격범위", f'{df["경락가"].min():,} ~ {df["경락가"].max():,}')
 
+    # 기존 오늘 경매조회 화면 안에서 바로 전 장날 대비 시세를 보여준다.
+    compare_map = render_daily_change(company, date_yyyymmdd, item, df)
+
     st.caption("품종 → 단위 → 등급 순으로 표시합니다. 공개 경매결과에 보이는 정보만 사용합니다.")
     st.markdown(
         '<div class="price-legend">🔴 머리(최고가) &nbsp; 🟡 중간(실제 경락 중 중앙값) &nbsp; 🔵 꼬리(최저가)</div>',
@@ -502,6 +505,17 @@ def render_company(company: Dict[str, str], date_yyyymmdd: str, item: str) -> pd
                     avg = round(mean(prices))
 
                     st.markdown(f"**{grade}** · {len(g):,}건")
+                    compared = compare_map.get((str(item_name), _trend_unit_normalize(unit), str(grade)))
+                    if compared is not None:
+                        if pd.notna(compared["등락액"]):
+                            st.caption(
+                                f'전 장날 {int(compared["전장 평균"]):,}원 → 이번 장 '
+                                f'{int(compared["오늘 평균"]):,}원 · '
+                                f'{compared["판정"]} {int(compared["등락액"]):+,}원 '
+                                f'({float(compared["등락률(%)"]):+.1f}%)'
+                            )
+                        else:
+                            st.caption("전 장날에 동일 품종·중량·등급 경락가가 없어 비교할 수 없습니다.")
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("머리", f"{head:,}")
                     c2.metric("중간", f"{middle:,}")
@@ -2643,19 +2657,155 @@ def render_period_price_analysis():
     )
 
 
+
+# =========================================================
+# 기존 경매조회 화면 안에서 전 장날 대비 시세 표시
+# =========================================================
+@st.cache_data(ttl=300, show_spinner=False)
+def find_previous_company_auction(today_yyyymmdd: str, item: str,
+                                  market_name: str, company_code: str,
+                                  lookback_days: int = 10):
+    """같은 법인·품목의 가장 가까운 이전 거래 장일자를 찾는다.
+
+    도중에 수집 실패가 나면 더 이전 날짜를 '직전 장'이라 주장하지 않는다.
+    """
+    from datetime import timedelta
+
+    try:
+        today = datetime.strptime(today_yyyymmdd, "%Y%m%d").date()
+    except ValueError:
+        return "", pd.DataFrame(), "선택한 장일자가 올바르지 않습니다."
+
+    for offset in range(1, lookback_days + 1):
+        day = today - timedelta(days=offset)
+        ymd = day.strftime("%Y%m%d")
+        try:
+            rows = fetch_all_company_rows(ymd, item, market_name, company_code)
+        except Exception as exc:
+            return "", pd.DataFrame(), f"{ymd} 조회 실패: {str(exc)[:180]}"
+
+        if rows.empty:
+            continue
+        # 사이트의 광범위한 검색결과에 다른 품목이 섞여도 비교하지 않는다.
+        rows = rows[
+            rows["품목(품종)"].astype(str).str.contains(re.escape(item), regex=True, na=False)
+        ].copy()
+        if not rows.empty:
+            rows["경락가"] = pd.to_numeric(rows["경락가"], errors="coerce")
+            rows = rows[rows["경락가"].notna() & (rows["경락가"] > 0)].copy()
+        if not rows.empty:
+            return ymd, rows, ""
+
+    return "", pd.DataFrame(), f"이전 {lookback_days}일 동안 같은 법인·품목 거래가 확인되지 않았습니다."
+
+
+def _daily_price_groups(rows: pd.DataFrame) -> pd.DataFrame:
+    """품목 원문, 중량/포장, 원본 등급을 유지해 가격을 따로 집계한다."""
+    cols = ["품목(품종)", "비교단위", "등급", "평균가", "최고가", "최저가", "거래건수"]
+    if rows.empty:
+        return pd.DataFrame(columns=cols)
+    df = rows.copy()
+    df["경락가"] = pd.to_numeric(df["경락가"], errors="coerce")
+    df = df[df["경락가"].notna() & (df["경락가"] > 0)].copy()
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+    df["비교단위"] = df["단위"].map(_trend_unit_normalize)
+    df["등급"] = df["등급"].fillna("미표기").astype(str)
+    df["품목(품종)"] = df["품목(품종)"].astype(str)
+    out = df.groupby(["품목(품종)", "비교단위", "등급"], as_index=False).agg(
+        평균가=("경락가", "mean"), 최고가=("경락가", "max"),
+        최저가=("경락가", "min"), 거래건수=("경락가", "size")
+    )
+    return out
+
+
+def build_daily_change_table(today_rows: pd.DataFrame, previous_rows: pd.DataFrame,
+                             previous_date: str) -> pd.DataFrame:
+    """오늘과 전 장날의 같은 품종·중량/포장·등급끼리만 가격 비교."""
+    today = _daily_price_groups(today_rows)
+    prev = _daily_price_groups(previous_rows)
+    prev_map = {
+        (r["품목(품종)"], r["비교단위"], r["등급"]): r
+        for _, r in prev.iterrows()
+    }
+    output = []
+    for _, r in today.iterrows():
+        key = (r["품목(품종)"], r["비교단위"], r["등급"])
+        old = prev_map.get(key)
+        cur_mean = float(r["평균가"])
+        if old is None:
+            output.append({
+                "품목(품종)":key[0], "단위":key[1], "등급":key[2],
+                "오늘 평균":round(cur_mean), "전장 평균":None,
+                "등락액":None, "등락률(%)":None, "판정":"비교자료 없음",
+                "오늘 건수":int(r["거래건수"]), "전장 건수":0,
+                "전장일":previous_date or "—"
+            })
+            continue
+        old_mean = float(old["평균가"])
+        diff = cur_mean - old_mean
+        rate = (diff / old_mean * 100) if old_mean > 0 else None
+        direction = "▲ 상승" if diff > 0.000001 else "▼ 하락" if diff < -0.000001 else "━ 보합"
+        output.append({
+            "품목(품종)":key[0], "단위":key[1], "등급":key[2],
+            "오늘 평균":round(cur_mean), "전장 평균":round(old_mean),
+            "등락액":round(diff), "등락률(%)":round(rate, 1) if rate is not None else None,
+            "판정":direction, "오늘 건수":int(r["거래건수"]),
+            "전장 건수":int(old["거래건수"]), "전장일":previous_date
+        })
+    return pd.DataFrame(output)
+
+
+def render_daily_change(company: Dict[str, str], date_yyyymmdd: str,
+                        item: str, today_rows: pd.DataFrame) -> dict:
+    """현재 경매조회 결과 위에서 비교를 표시하고 등급별 보조문구를 반환."""
+    if not st.session_state.get("daily_compare_enabled", True) or today_rows.empty:
+        return {}
+    st.markdown("#### 📉 전 장날 대비 가격 변화")
+    st.caption("같은 법인·품종·중량/포장·등급 기준 · 경락 건별 평균가 비교 (수량 가중평균 아님)")
+    with st.spinner("전 장날의 같은 품목 경락자료를 찾는 중..."):
+        prev_date, prev_rows, error = find_previous_company_auction(
+            date_yyyymmdd, item, company["market"], company["code"]
+        )
+    if error:
+        st.info(f"전 장날 대비 비교 불가: {error}")
+        return {}
+
+    table = build_daily_change_table(today_rows, prev_rows, prev_date)
+    if table.empty:
+        st.info("비교할 현재 경락내역이 없습니다.")
+        return {}
+    st.caption(f"이번 장: {date_yyyymmdd} · 비교 장: {prev_date} · {company['name']}")
+    visible = table[["품목(품종)", "단위", "등급", "오늘 평균", "전장 평균", "등락액", "등락률(%)", "판정", "오늘 건수", "전장 건수"]].copy()
+    st.dataframe(visible, use_container_width=True, hide_index=True,
+                 column_config={
+                    "오늘 평균": st.column_config.NumberColumn(format="%d원"),
+                    "전장 평균": st.column_config.NumberColumn(format="%d원"),
+                    "등락액": st.column_config.NumberColumn(format="%+d원"),
+                    "등락률(%)": st.column_config.NumberColumn(format="%+.1f%%"),
+                 })
+    st.caption("※ 공개 조회 결과의 개별 수량이 없어 단순평균이며, 품질·산지 차이에 따른 등락도 포함될 수 있습니다.")
+    st.download_button(
+        "전 장날 대비 비교표 CSV",
+        data=table.to_csv(index=False).encode("utf-8-sig"),
+        file_name=f"전장대비_{company['market']}_{company['name']}_{item}_{date_yyyymmdd}.csv",
+        mime="text/csv", key=f"compare_dl_{company['market']}_{company['code']}_{date_yyyymmdd}_{item}"
+    )
+    return {
+        (str(r["품목(품종)"]), str(r["단위"]), str(r["등급"])): r
+        for _, r in table.iterrows()
+    }
+
+
 # =========================================================
 # UI
 # =========================================================
 mode = st.radio(
     "기능",
-    ["📊 경매조회", "📈 기간 시세분석", "🧩 등외 해체", "🔍 세부규격 찾기"],
+    ["📊 경매조회", "🧩 등외 해체", "🔍 세부규격 찾기"],
     horizontal=True,
     label_visibility="collapsed",
 )
-
-if mode == "📈 기간 시세분석":
-    render_period_price_analysis()
-    st.stop()
 
 if mode == "🧩 등외 해체":
     render_grade_decoder()
@@ -2719,6 +2869,13 @@ with st.expander("🧩 세부규격 자동보강 설정", expanded=False):
         st.success("자동보강 ON · 경매결과 아래에 확인된 규격을 붙입니다.")
     elif enrich_toggle:
         st.warning("자동보강 ON · API 키를 입력해야 실제 보강이 시작됩니다.")
+
+st.toggle(
+    "📉 전 장날 대비 가격 등락 표시",
+    value=True,
+    key="daily_compare_enabled",
+    help="현재 선택한 법인·품목의 가장 최근 이전 거래 장일자를 찾아 동일 품종·중량·등급별 평균 경락가를 비교합니다.",
+)
 
 search_clicked = st.button("경매 법인 찾기", type="primary", use_container_width=True)
 
